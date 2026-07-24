@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/moonson-cli"]
+
+# Fields shared by every crate in the workspace. Individual crates inherit
+# these with `version.workspace = true`, `edition.workspace = true`, etc.
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/CHANGE_ME/moonson"
+description = "A modern, high-density load testing tool with a Luau scripting DSL."
+rust-version = "1.75"
+
+# Dependencies used by more than one crate are pinned here once, so the whole
+# workspace stays on the same version. Crates opt in with
+# `some_dep = { workspace = true }`. We start empty and add these in Step 1+.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+
+# Release builds: optimise hard. A load generator spends all its time in hot
+# loops, so this matters. (Has no effect on `cargo build`, only `--release`.)
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

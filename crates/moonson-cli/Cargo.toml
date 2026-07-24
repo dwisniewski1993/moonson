@@ -1,0 +1,15 @@
+[package]
+name = "moonson-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for the moonson load testing tool."
+
+# The compiled program is called `moonson` even though the crate is
+# `moonson-cli`. So users run `moonson ...`, not `moonson-cli ...`.
+[[bin]]
+name = "moonson"
+path = "src/main.rs"
+
+[dependencies]

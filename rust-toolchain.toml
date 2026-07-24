@@ -1,0 +1,5 @@
+# Pins the toolchain for everyone who builds the project, so we all get the same
+# compiler and the same lints. `rustup` reads this file automatically.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

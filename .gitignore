@@ -1,0 +1,12 @@
+# Rust build output (can always be regenerated with `cargo build`)
+/target
+
+# We DO commit Cargo.lock: moonson is an application, not a library, so we want
+# reproducible builds. That is why it is not listed here.
+
+# Editor / OS noise
+**/*.rs.bk
+*.pdb
+.DS_Store
+.idea/
+.vscode/
