@@ -16,3 +16,5 @@ path = "src/main.rs"
 tokio = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
+mlua = { workspace = true }

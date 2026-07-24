@@ -11,12 +11,12 @@ Workspace, license, CI, and these documents. A binary that builds and prints a
 banner.
 **Check:** `cargo run -p moonson-cli` prints the moonson banner.
 
-### Step 1 — First async HTTP GET
+### Step 1 — First async HTTP GET  ✅
 Replace the banner with one real request using Tokio + reqwest.
 **Teaches:** dependencies, `async`/`await`, the `#[tokio::main]` entry point.
 **Check:** `cargo run -p moonson-cli -- https://httpbin.org/get` prints `200`.
 
-### Step 2 — Many virtual users for a duration
+### Step 2 — Many virtual users for a duration  ✅
 Spawn N async tasks that loop the request for D seconds; count them.
 **Teaches:** `tokio::spawn`, `Arc`, atomic counters, `tokio::time`.
 **Check:** `... --vus 50 --duration 5s <url>` prints total requests and req/s.

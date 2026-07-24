@@ -8,7 +8,7 @@ members = ["crates/moonson-cli"]
 version = "0.0.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/CHANGE_ME/moonson"
+repository = "https://github.com/dwisniewski1993/moonson"
 description = "A modern, high-density load testing tool with a Luau scripting DSL."
 rust-version = "1.75"
 
@@ -24,6 +24,15 @@ reqwest = { version = "0.12" }
 # Ergonomic error handling: lets `main` return `Result<()>`, use the `?` operator,
 # and attach context to errors with `.with_context(...)`.
 anyhow = "1"
+# Command-line argument parsing. The `derive` feature lets us describe the CLI as
+# a struct with attributes instead of parsing arguments by hand.
+clap = { version = "4", features = ["derive"] }
+# Embeds the Luau scripting engine. `luau` compiles Luau from bundled C++ source
+# (first build needs a C++ compiler; on macOS: Xcode Command Line Tools). `send`
+# makes Lua values Send, which (a) lets mlua::Error convert through anyhow's `?`
+# and (b) lets us move a Lua state into a spawned task per VU in Step 5. The
+# `async` feature arrives in Step 4.
+mlua = { version = "0.10", features = ["luau", "send"] }
 
 # Release builds: optimise hard. A load generator spends all its time in hot
 # loops, so this matters. (Has no effect on `cargo build`, only `--release`.)
