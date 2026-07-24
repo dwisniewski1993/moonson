@@ -17,6 +17,13 @@ rust-version = "1.75"
 # `some_dep = { workspace = true }`. We start empty and add these in Step 1+.
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+# HTTP client for the first milestone. Default features (incl. native TLS) so it
+# builds with no extra system setup on macOS. We may switch to a rustls backend
+# during the density milestone (M3), where the Linux/OpenSSL story matters.
+reqwest = { version = "0.12" }
+# Ergonomic error handling: lets `main` return `Result<()>`, use the `?` operator,
+# and attach context to errors with `.with_context(...)`.
+anyhow = "1"
 
 # Release builds: optimise hard. A load generator spends all its time in hot
 # loops, so this matters. (Has no effect on `cargo build`, only `--release`.)

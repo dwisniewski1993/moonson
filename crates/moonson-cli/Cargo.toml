@@ -13,3 +13,6 @@ name = "moonson"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
