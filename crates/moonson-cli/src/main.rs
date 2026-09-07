@@ -1,9 +1,10 @@
 //! moonson — command-line entry point.
 //!
-//! Step 4 makes the scripting bridge real. `http.get` is now an asynchronous
-//! host function that performs an actual HTTP request, and the scenario body is
-//! run as a coroutine (`call_async`) so it can await that request without
-//! blocking the thread. This is the proof that the whole DSL model works.
+//! Step 5 completes the walking skeleton. The `run` subcommand now drives a Luau
+//! scenario across N virtual users for a fixed duration: each VU is a spawned
+//! task with its own Lua state, looping the scenario until the deadline. Every
+//! request's latency and outcome is recorded, and the run ends with a report
+//! (requests, throughput, and p50/p95/p99 latency).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use hdrhistogram::Histogram;
 use mlua::{Function, Lua};
+
+/// Upper bound for the latency histogram: 60 seconds, expressed in microseconds.
+const MAX_LATENCY_US: u64 = 60_000_000;
 
 #[derive(Parser)]
 #[command(
@@ -39,35 +44,98 @@ enum Command {
         /// How long to run: e.g. 500ms, 10s, 2m.
         #[arg(long, default_value = "5s")]
         duration: String,
+        /// Per-request timeout: e.g. 5s, 500ms.
+        #[arg(long, default_value = "30s")]
+        timeout: String,
     },
-    /// Run a Luau scenario file once, performing real HTTP requests.
+    /// Run a Luau scenario across N virtual users for a fixed duration.
     Run {
         /// Path to a .luau scenario file.
         script: PathBuf,
         /// Base URL that scenario paths (e.g. "/get") are joined onto.
         #[arg(long, default_value = "https://httpbin.org")]
         base_url: String,
+        /// Number of virtual users looping the scenario.
+        #[arg(long, default_value_t = 1)]
+        vus: u32,
+        /// How long to run: e.g. 500ms, 10s, 2m.
+        #[arg(long, default_value = "10s")]
+        duration: String,
+        /// Per-request timeout: e.g. 5s, 500ms.
+        #[arg(long, default_value = "30s")]
+        timeout: String,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Load { url, vus, duration } => {
+        Command::Load {
+            url,
+            vus,
+            duration,
+            timeout,
+        } => {
             let duration = parse_duration(&duration)?;
-            run_load(url, vus, duration).await
+            let timeout = parse_duration(&timeout)?;
+            run_load(url, vus, duration, timeout).await
         }
-        Command::Run { script, base_url } => run_script(&script, base_url).await,
+        Command::Run {
+            script,
+            base_url,
+            vus,
+            duration,
+            timeout,
+        } => {
+            let duration = parse_duration(&duration)?;
+            let timeout = parse_duration(&timeout)?;
+            run_scenario(&script, base_url, vus, duration, timeout).await
+        }
+    }
+}
+
+/// Per-virtual-user statistics. Each VU records into its own instance (so there
+/// is no lock contention between VUs); we merge them into one at the end.
+struct VuStats {
+    /// Request latencies, in microseconds.
+    latency: Histogram<u64>,
+    /// Responses received (any HTTP status).
+    ok: u64,
+    /// Transport failures (no response: DNS, connection, TLS...).
+    failed: u64,
+}
+
+impl VuStats {
+    fn new() -> Self {
+        Self {
+            latency: Histogram::new_with_bounds(1, MAX_LATENCY_US, 3)
+                .expect("valid histogram bounds"),
+            ok: 0,
+            failed: 0,
+        }
+    }
+
+    fn record(&mut self, elapsed: Duration, ok: bool) {
+        let micros = (elapsed.as_micros() as u64).clamp(1, MAX_LATENCY_US);
+        let _ = self.latency.record(micros);
+        if ok {
+            self.ok += 1;
+        } else {
+            self.failed += 1;
+        }
     }
 }
 
 /// Raw request loop (Step 2), behind the `load` subcommand.
-async fn run_load(url: String, vus: u32, duration: Duration) -> Result<()> {
+async fn run_load(url: String, vus: u32, duration: Duration, timeout: Duration) -> Result<()> {
     println!("Running {vus} VU(s) against {url} for {duration:?}...");
 
     let ok = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")?;
     let deadline = Instant::now() + duration;
 
     let mut handles = Vec::with_capacity(vus as usize);
@@ -99,72 +167,148 @@ async fn run_load(url: String, vus: u32, duration: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Run a Luau scenario file once, performing real asynchronous HTTP requests.
-///
-/// Two things are new versus Step 3. First, `http.get` is now an async host
-/// function (`create_async_function`) that actually sends the request and
-/// returns a `{ status = ... }` table. Second, the scenario body runs with
-/// `call_async` — as a coroutine — so when it calls `http.get` the coroutine
-/// suspends and awaits the request instead of blocking the thread.
-async fn run_script(path: &Path, base_url: String) -> Result<()> {
+/// Drive a Luau scenario across `vus` virtual users for `duration`, then report.
+async fn run_scenario(
+    path: &Path,
+    base_url: String,
+    vus: u32,
+    duration: Duration,
+    timeout: Duration,
+) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read scenario file {}", path.display()))?;
 
-    let lua = Lua::new();
-    let client = reqwest::Client::new();
+    println!(
+        "Running {} with {vus} VU(s) for {duration:?} against {base_url}...",
+        path.display()
+    );
 
-    // http.get(path) -> { status = <number> }. A real async request; the base
-    // URL is prepended so scenarios can use short paths like "/get".
+    // One client shared by all VUs, so they share the connection pool.
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")?;
+    let deadline = Instant::now() + duration;
+
+    // Spawn one task per VU. We keep a handle to each VU's stats so we can merge
+    // them once every task has finished.
+    let mut handles = Vec::with_capacity(vus as usize);
+    let mut all_stats = Vec::with_capacity(vus as usize);
+    for vu_id in 0..vus {
+        let stats = Arc::new(Mutex::new(VuStats::new()));
+        all_stats.push(stats.clone());
+        handles.push(tokio::spawn(run_one_vu(
+            vu_id,
+            source.clone(),
+            base_url.clone(),
+            client.clone(),
+            stats,
+            deadline,
+        )));
+    }
+    for handle in handles {
+        // First `?`: the task did not panic. Second `?`: the scenario inside it
+        // did not return an error.
+        handle.await.context("a virtual user task panicked")??;
+    }
+
+    // Merge every VU's histogram and counters into a single view.
+    let mut latency =
+        Histogram::<u64>::new_with_bounds(1, MAX_LATENCY_US, 3).expect("valid histogram bounds");
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    for stats in &all_stats {
+        let stats = stats.lock().unwrap();
+        latency
+            .add(&stats.latency)
+            .expect("histograms share bounds");
+        ok += stats.ok;
+        failed += stats.failed;
+    }
+
+    let total = ok + failed;
+    let secs = duration.as_secs_f64();
+    let rps = if secs > 0.0 { total as f64 / secs } else { 0.0 };
+    println!("---");
+    println!("requests: {total}   ok: {ok}   errors: {failed}");
+    println!("throughput: {rps:.0} req/s");
+    println!(
+        "latency (ms): p50 {:.1}  p95 {:.1}  p99 {:.1}  max {:.1}",
+        latency.value_at_quantile(0.50) as f64 / 1000.0,
+        latency.value_at_quantile(0.95) as f64 / 1000.0,
+        latency.value_at_quantile(0.99) as f64 / 1000.0,
+        latency.max() as f64 / 1000.0,
+    );
+    Ok(())
+}
+
+/// One virtual user: build its own Lua state, load the scenario, and loop it
+/// until the deadline, recording each request into `stats`.
+async fn run_one_vu(
+    vu_id: u32,
+    source: String,
+    base_url: String,
+    client: reqwest::Client,
+    stats: Arc<Mutex<VuStats>>,
+    deadline: Instant,
+) -> Result<()> {
+    let lua = Lua::new();
+
+    // http.get(path) -> { status }: real async request, timed and recorded.
     let http = lua.create_table()?;
-    let get_client = client.clone();
-    let get_base = base_url.clone();
     http.set(
         "get",
         lua.create_async_function(move |lua, path: String| {
-            // These clones are moved into the future so it owns everything it
-            // needs (it must be `'static`).
-            let client = get_client.clone();
-            let base = get_base.clone();
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let stats = stats.clone();
             async move {
-                let url = format!("{base}{path}");
-                let response = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(mlua::Error::external)?;
+                let url = format!("{base_url}{path}");
+                let start = Instant::now();
+                let outcome = client.get(&url).send().await;
+                let elapsed = start.elapsed();
+
                 let result = lua.create_table()?;
-                result.set("status", response.status().as_u16())?;
+                match outcome {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        stats.lock().unwrap().record(elapsed, true);
+                        result.set("status", status)?;
+                    }
+                    Err(_error) => {
+                        stats.lock().unwrap().record(elapsed, false);
+                        result.set("status", 0)?; // 0 = transport error, no response
+                    }
+                }
                 Ok(result)
             }
         })?,
     )?;
     lua.globals().set("http", http)?;
 
-    // scenario(name, body): remember the scenario so we can run it (async) after
-    // the file finishes loading. We stash it in a shared slot because the host
-    // function only gets shared access to its surroundings.
-    let slot: Arc<Mutex<Option<(String, Function)>>> = Arc::new(Mutex::new(None));
+    // scenario(name, body): stash the body so we can loop it after loading.
+    let slot: Arc<Mutex<Option<Function>>> = Arc::new(Mutex::new(None));
     let store = slot.clone();
     lua.globals().set(
         "scenario",
-        lua.create_function(move |_, (name, body): (String, Function)| {
-            *store.lock().unwrap() = Some((name, body));
+        lua.create_function(move |_, (_name, body): (String, Function)| {
+            *store.lock().unwrap() = Some(body);
             Ok(())
         })?,
     )?;
 
-    // Loading the file runs its top-level code, which calls scenario(...).
     lua.load(source.as_str())
         .exec()
-        .with_context(|| format!("error while loading {}", path.display()))?;
+        .context("error while loading scenario")?;
+    let body = slot
+        .lock()
+        .unwrap()
+        .take()
+        .context("script defined no scenario; call scenario(name, function() ... end)")?;
 
-    // Run the stored scenario as a coroutine, driving its async http.get calls.
-    let scenario = slot.lock().unwrap().take();
-    let (name, body) =
-        scenario.context("script defined no scenario; call scenario(name, function() ... end)")?;
-    println!("scenario \"{name}\" running against {base_url}...");
-    let _: () = body.call_async(1).await?;
-    println!("done.");
+    while Instant::now() < deadline {
+        let _: () = body.call_async(vu_id).await?;
+    }
     Ok(())
 }
 
@@ -217,9 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn vustats_records_and_merges() {
+        // Metrics plumbing, tested without any network.
+        let mut a = VuStats::new();
+        a.record(Duration::from_millis(10), true);
+        a.record(Duration::from_millis(20), false);
+        let mut b = VuStats::new();
+        b.record(Duration::from_millis(30), true);
+
+        a.latency.add(&b.latency).unwrap();
+        assert_eq!(a.ok, 1);
+        assert_eq!(a.failed, 1);
+        assert_eq!(a.latency.len(), 3); // three recorded samples in total
+    }
+
+    #[test]
     fn scenario_calls_http_get_for_each_call() {
-        // Sync round-trip check (no async, no network): a script that calls
-        // http.get twice should invoke our host function twice.
+        // Sync Rust <-> Luau round-trip (no async, no network).
         let lua = Lua::new();
         let calls = Arc::new(AtomicU64::new(0));
 
@@ -262,9 +420,8 @@ mod tests {
 
     #[tokio::test]
     async fn async_host_function_runs_inside_a_coroutine() {
-        // The crux of Step 4, tested without any network: an async host function
-        // that yields and then returns a value, called from a Luau coroutine via
-        // `call_async`.
+        // The async bridge, tested without network: an async host function that
+        // yields then returns a value, called from a Luau coroutine.
         let lua = Lua::new();
         let answer = lua
             .create_async_function(|_, ()| async move {

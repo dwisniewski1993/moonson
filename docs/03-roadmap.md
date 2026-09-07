@@ -32,7 +32,7 @@ Make `http.get` a real async host function; run the scenario as a coroutine so
 the script can `await` real HTTP without blocking. Proves the whole DSL model.
 **Check:** the script performs a real GET and reads `r.status`; `check()` works.
 
-### Step 5 — Scale + metrics (M0 done)
+### Step 5 — Scale + metrics (M0 done)  ✅
 Run the scenario across N VUs for a duration; aggregate latency into a histogram;
 print the report.
 **Check:** `moonson run examples/smoke.luau --vus 100 --duration 10s` prints
