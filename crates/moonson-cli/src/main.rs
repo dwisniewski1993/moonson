@@ -239,6 +239,11 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+    /// Parse a .proto file and print its services and methods.
+    ProtoInfo {
+        /// Path to a .proto file.
+        proto: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -268,6 +273,7 @@ async fn main() -> Result<()> {
         Command::ServeEcho { addr } => serve_echo(addr).await,
         Command::ServeGrpc { addr } => serve_grpc(addr).await,
         Command::ServeBench { addr } => serve_bench(addr).await,
+        Command::ProtoInfo { proto } => proto_info(&proto),
     }
 }
 
@@ -763,13 +769,44 @@ async fn serve_bench(addr: String) -> Result<()> {
         let io = TokioIo::new(stream);
         tokio::spawn(async move {
             let service = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
-                Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(
+                    b"ok",
+                ))))
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
                 .await;
         });
     }
+}
+
+/// Compile a `.proto` file at runtime and print the services and methods it
+/// declares. This is the parsing foundation for dynamic gRPC calls.
+fn proto_info(path: &Path) -> Result<()> {
+    let include = path.parent().unwrap_or_else(|| Path::new("."));
+    let descriptor_set = protox::compile([path], [include])
+        .with_context(|| format!("failed to compile {}", path.display()))?;
+    let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(descriptor_set)
+        .context("failed to build descriptor pool")?;
+
+    for service in pool.services() {
+        println!("service {}", service.full_name());
+        for method in service.methods() {
+            let kind = match (method.is_client_streaming(), method.is_server_streaming()) {
+                (false, false) => "unary",
+                (true, false) => "client-streaming",
+                (false, true) => "server-streaming",
+                (true, true) => "bidi-streaming",
+            };
+            println!(
+                "  {} [{kind}]  {} -> {}",
+                method.name(),
+                method.input().full_name(),
+                method.output().full_name()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Derive a WebSocket base URL from an HTTP one by swapping the scheme

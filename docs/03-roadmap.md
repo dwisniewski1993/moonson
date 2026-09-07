@@ -38,7 +38,7 @@ print the report.
 **Check:** `moonson run examples/smoke.luau --vus 100 --duration 10s` prints
 requests, RPS, p50/p95/p99, and errors.
 
-### M0.1 — finish the HTTP DSL
+### M0.1 — finish the HTTP DSL  ✅
 `http.post` with a JSON body and headers, optional headers on `http.get`,
 `check()` for assertions, and `think()` for pacing — so `examples/smoke.luau`
 runs for real and the report includes a checks line.
@@ -46,8 +46,11 @@ runs for real and the report includes a checks line.
 ## After M0
 
 - **M1 — WebSocket** (wedge #2) ✅ — connect/send/recv/close, WS metrics, HTTP+WS in one VU
-- **M2 — gRPC** (wedge #2) — unary + bidi streaming + built-in echo server
-- **M3 — Density benchmark & fast path** (wedge #1) — in progress: harness + `serve-bench` vs k6
+- **M2 — gRPC** (wedge #2) ✅ *(partial)* — unary + bidi streaming + built-in echo
+  server; general **dynamic `.proto`** loading still to do
+- **M3 — Density** (wedge #1) — benchmark vs k6 ✅ (see
+  [`benchmarks/density.md`](benchmarks/density.md)); **fast path + Lua-state
+  pooling** (cut the ~0.72 MB/VU) still to do
 - **M4 — Observability, data feeds, ramp profiles**
 
 We revisit and rewrite this file as we learn. That is expected, not a failure.

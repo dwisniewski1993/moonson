@@ -27,6 +27,8 @@ prost = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+protox = { workspace = true }
+prost-reflect = { workspace = true }
 
 [build-dependencies]
 # Compiles proto/echo.proto at build time; protoc-bin-vendored ships a protoc
