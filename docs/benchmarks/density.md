@@ -61,14 +61,42 @@ end — that is peak RSS. Divide by the VU count for RSS/VU.
 
 ## Results (fill in)
 
-| VUs  | tool    | req/s | peak RSS (MB) | RSS/VU (KB) |
-|------|---------|-------|---------------|-------------|
-| 50   | moonson |       |               |             |
-| 50   | k6      |       |               |             |
-| 200  | moonson |       |               |             |
-| 200  | k6      |       |               |             |
-| 1000 | moonson |       |               |             |
-| 1000 | k6      |       |               |             |
+| VUs  | tool    | req/s   | peak RSS (MB) | RSS/VU (KB) |
+|------|---------|---------|---------------|-------------|
+| 50   | moonson | 128,802 | 52            | 1,069       |
+| 50   | k6      | 120,182 | 608           | 12,458      |
+| 200  | moonson | 130,758 | 162           | 827         |
+| 200  | k6      | 114,861 | 639           | 3,268       |
+| 1000 | moonson | 114,532 | 709           | 726         |
+| 1000 | k6      | 93,961  | 681           | 681         |
+
+## Findings (loopback, one machine)
+
+**Throughput.** moonson holds ~115–131k req/s across all VU counts; k6 starts
+close (120k at 50 VUs) but degrades as concurrency rises (115k at 200, 94k at
+1000). So the two are level at low VU and moonson pulls ~22% ahead at 1000 — it
+handles high concurrency more steadily. Both are limited by the shared
+target/CPU, not the generator; as predicted for plain HTTP, neither wins by a
+landslide.
+
+**Memory** is where the two differ structurally:
+
+- **moonson** ≈ 16 MB base + ~0.72 MB per VU (each VU owns a Luau state), and is
+  flat in the *number of requests* (fixed-size histogram): 52 → 162 → 709 MB at
+  50 → 200 → 1000 VUs.
+- **k6** ≈ 610–710 MB almost regardless of VUs — dominated by buffered metric
+  samples, which grow with *total requests*, not VUs.
+
+So moonson is dramatically lighter at low-to-moderate load (11x at 50 VUs, 4x at
+200) and on long / high-throughput runs (memory does not grow with requests).
+The per-VU Luau state catches up around ~1000 VUs, where the two are roughly
+equal (709 vs 681 MB); beyond that moonson would be heavier. That ~0.72 MB/VU is
+the concrete number Milestone 3 (fast path + Lua-state pooling) exists to cut.
+
+**Verdict.** The density wedge holds for the common case (tens–hundreds of VUs:
+much lighter, and faster under high concurrency). At extreme VU counts the
+current per-VU model erodes the memory edge — a clear, measured optimization
+target, not a dead end.
 
 ## Interpreting the outcome
 

@@ -644,7 +644,14 @@ async fn serve_echo(addr: String) -> Result<()> {
         .with_context(|| format!("cannot bind {addr}"))?;
     println!("echo server listening on http+ws://{addr} (Ctrl-C to stop)");
     loop {
-        let (mut stream, _peer) = listener.accept().await.context("accept failed")?;
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("serve-echo: accept error: {error}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             // Peek at the request without consuming it, so we can tell a
             // WebSocket upgrade apart from a plain HTTP request on the same port.
@@ -745,7 +752,14 @@ async fn serve_bench(addr: String) -> Result<()> {
         .with_context(|| format!("cannot bind {addr}"))?;
     println!("bench target listening on http://{addr} (Ctrl-C to stop)");
     loop {
-        let (stream, _peer) = listener.accept().await.context("accept failed")?;
+        let (stream, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("serve-bench: accept error: {error}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+        };
         let io = TokioIo::new(stream);
         tokio::spawn(async move {
             let service = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
