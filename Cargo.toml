@@ -5,7 +5,7 @@ members = ["crates/moonson-cli"]
 # Fields shared by every crate in the workspace. Individual crates inherit
 # these with `version.workspace = true`, `edition.workspace = true`, etc.
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/dwisniewski1993/moonson"

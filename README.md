@@ -4,8 +4,9 @@ A modern, high-density **load testing tool**: a fast execution engine written in
 **Rust**, driven by test scenarios written in **Luau** (a small, fast, typed
 scripting language).
 
-> **Status: early, but working.** HTTP and WebSocket load tests run today (see
-> below); gRPC and the density work are next. Progress in
+> **Status: early, but working.** HTTP, WebSocket, and gRPC (dynamic `.proto`,
+> unary + streaming) load tests run today, and it's been benchmarked against k6
+> (see [`docs/benchmarks/density.md`](docs/benchmarks/density.md)). Progress in
 > [`docs/03-roadmap.md`](docs/03-roadmap.md).
 
 ## Why another load testing tool?
