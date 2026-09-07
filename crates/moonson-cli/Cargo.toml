@@ -19,3 +19,5 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 mlua = { workspace = true }
 hdrhistogram = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

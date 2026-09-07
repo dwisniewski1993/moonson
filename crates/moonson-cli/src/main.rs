@@ -1,9 +1,9 @@
 //! moonson — command-line entry point.
 //!
-//! M0.1 rounds out the HTTP DSL. Scenarios can now call `http.get`/`http.post`
-//! with headers and a JSON body, assert with `check()`, and pace with `think()`.
-//! Each VU still runs its own Lua state as a coroutine (Step 5); the report now
-//! also shows how many checks passed.
+//! M1 (step 1) adds WebSocket support to the scripting DSL: `websocket.connect`
+//! returns a connection object with async `:send`, `:recv`, and `:close` methods,
+//! so a scenario can hold a long-lived socket inside its coroutine — and mix it
+//! with HTTP in the same virtual user.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,11 +13,58 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use futures_util::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
 use mlua::{Function, Lua, Table, Value};
+use tokio_tungstenite::tungstenite::Message;
 
 /// Upper bound for the latency histogram: 60 seconds, expressed in microseconds.
 const MAX_LATENCY_US: u64 = 60_000_000;
+
+/// The concrete WebSocket stream type `connect_async` yields (TCP, optionally
+/// wrapped in TLS for `wss://`).
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A live WebSocket connection, exposed to Luau as a userdata object. The stream
+/// lives behind an async mutex so the `:send`/`:recv`/`:close` methods (which
+/// only get shared access to `self`) can still drive it.
+struct WsConn {
+    stream: tokio::sync::Mutex<WsStream>,
+}
+
+impl mlua::UserData for WsConn {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // ws:send(text) — send a text frame.
+        methods.add_async_method("send", |_, this, text: String| async move {
+            let mut stream = this.stream.lock().await;
+            stream
+                .send(Message::Text(text))
+                .await
+                .map_err(mlua::Error::external)?;
+            Ok(())
+        });
+
+        // ws:recv() -> string | nil — wait for the next message; nil if closed.
+        methods.add_async_method("recv", |_, this, ()| async move {
+            let mut stream = this.stream.lock().await;
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => Ok(Some(t.as_str().to_owned())),
+                Some(Ok(Message::Binary(b))) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
+                Some(Ok(_)) => Ok(Some(String::new())), // ping/pong/close control frames
+                Some(Err(e)) => Err(mlua::Error::external(e)),
+                None => Ok(None),
+            }
+        });
+
+        // ws:close() — close the connection.
+        methods.add_async_method("close", |_, this, ()| async move {
+            let mut stream = this.stream.lock().await;
+            stream.close(None).await.map_err(mlua::Error::external)?;
+            Ok(())
+        });
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -64,6 +111,12 @@ enum Command {
         #[arg(long, default_value = "30s")]
         timeout: String,
     },
+    /// Run a local WebSocket echo server (a reliable target for `run` scenarios).
+    ServeEcho {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:9001")]
+        addr: String,
+    },
 }
 
 #[tokio::main]
@@ -90,6 +143,7 @@ async fn main() -> Result<()> {
             let timeout = parse_duration(&timeout)?;
             run_scenario(&script, base_url, vus, duration, timeout).await
         }
+        Command::ServeEcho { addr } => serve_echo(addr).await,
     }
 }
 
@@ -248,13 +302,15 @@ async fn run_scenario(
     println!("---");
     println!("requests: {total}   ok: {ok}   errors: {failed}");
     println!("throughput: {rps:.0} req/s");
-    println!(
-        "latency (ms): p50 {:.1}  p95 {:.1}  p99 {:.1}  max {:.1}",
-        latency.value_at_quantile(0.50) as f64 / 1000.0,
-        latency.value_at_quantile(0.95) as f64 / 1000.0,
-        latency.value_at_quantile(0.99) as f64 / 1000.0,
-        latency.max() as f64 / 1000.0,
-    );
+    if total > 0 {
+        println!(
+            "latency (ms): p50 {:.1}  p95 {:.1}  p99 {:.1}  max {:.1}",
+            latency.value_at_quantile(0.50) as f64 / 1000.0,
+            latency.value_at_quantile(0.95) as f64 / 1000.0,
+            latency.value_at_quantile(0.99) as f64 / 1000.0,
+            latency.max() as f64 / 1000.0,
+        );
+    }
     let checks_total = checks_passed + checks_failed;
     if checks_total > 0 {
         println!("checks: {checks_passed}/{checks_total} passed");
@@ -284,16 +340,43 @@ async fn run_one_vu(
         let client = client.clone();
         let base_url = base_url.clone();
         let stats = stats.clone();
-        let function = lua.create_async_function(move |lua, (path, opts): (String, Option<Table>)| {
-            let client = client.clone();
-            let base_url = base_url.clone();
-            let stats = stats.clone();
-            let method = method.clone();
-            async move { perform_request(lua, client, base_url, stats, method, path, opts).await }
-        })?;
+        let function =
+            lua.create_async_function(move |lua, (path, opts): (String, Option<Table>)| {
+                let client = client.clone();
+                let base_url = base_url.clone();
+                let stats = stats.clone();
+                let method = method.clone();
+                async move {
+                    perform_request(lua, client, base_url, stats, method, path, opts).await
+                }
+            })?;
         http.set(name, function)?;
     }
     lua.globals().set("http", http)?;
+
+    // websocket.connect(path) -> connection object with :send/:recv/:close.
+    let ws_base = to_ws_base(&base_url);
+    let websocket = lua.create_table()?;
+    websocket.set(
+        "connect",
+        lua.create_async_function(move |lua, path: String| {
+            let ws_base = ws_base.clone();
+            async move {
+                let url = if path.starts_with("ws://") || path.starts_with("wss://") {
+                    path
+                } else {
+                    format!("{ws_base}{path}")
+                };
+                let (stream, _response) = tokio_tungstenite::connect_async(url)
+                    .await
+                    .map_err(mlua::Error::external)?;
+                lua.create_userdata(WsConn {
+                    stream: tokio::sync::Mutex::new(stream),
+                })
+            }
+        })?,
+    )?;
+    lua.globals().set("websocket", websocket)?;
 
     // think(seconds): pause this VU without blocking the thread.
     let think = lua.create_async_function(|_, seconds: f64| async move {
@@ -306,7 +389,7 @@ async fn run_one_vu(
     // return whether all passed. The booleans are evaluated in Lua before the
     // call, so we just count them.
     let check_stats = stats.clone();
-    let check = lua.create_function(move |_, (_response, checks): (Table, Table)| {
+    let check = lua.create_function(move |_, (_response, checks): (Value, Table)| {
         let mut all_passed = true;
         for pair in checks.pairs::<String, bool>() {
             let (_name, passed) = pair?;
@@ -392,6 +475,43 @@ async fn perform_request(
     Ok(result)
 }
 
+/// A tiny local WebSocket echo server, so `run` scenarios have a reliable target
+/// that does not depend on a public host being reachable.
+async fn serve_echo(addr: String) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("cannot bind {addr}"))?;
+    println!("echo server listening on ws://{addr} (Ctrl-C to stop)");
+    loop {
+        let (stream, _peer) = listener.accept().await.context("accept failed")?;
+        tokio::spawn(async move {
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            while let Some(Ok(message)) = ws.next().await {
+                if message.is_close() {
+                    break;
+                }
+                if (message.is_text() || message.is_binary()) && ws.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Derive a WebSocket base URL from an HTTP one by swapping the scheme
+/// (https -> wss, http -> ws).
+fn to_ws_base(base_url: &str) -> String {
+    if let Some(rest) = base_url.strip_prefix("https") {
+        format!("wss{rest}")
+    } else if let Some(rest) = base_url.strip_prefix("http") {
+        format!("ws{rest}")
+    } else {
+        base_url.to_owned()
+    }
+}
+
 /// Turn a string like "10s" into a `Duration`. Supports `ms`, `s`, and `m`.
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
@@ -438,6 +558,12 @@ mod tests {
     #[test]
     fn rejects_unknown_unit() {
         assert!(parse_duration("10h").is_err());
+    }
+
+    #[test]
+    fn derives_ws_base_from_http_base() {
+        assert_eq!(to_ws_base("https://example.com"), "wss://example.com");
+        assert_eq!(to_ws_base("http://localhost:8080"), "ws://localhost:8080");
     }
 
     #[test]
