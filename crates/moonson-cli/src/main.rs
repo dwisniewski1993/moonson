@@ -18,6 +18,11 @@ use hdrhistogram::Histogram;
 use mlua::{Function, Lua, Table, Value};
 use tokio_tungstenite::tungstenite::Message;
 
+/// gRPC types generated from `proto/echo.proto` at build time (see build.rs).
+mod echo {
+    tonic::include_proto!("echo");
+}
+
 /// Upper bound for the latency histogram: 60 seconds, expressed in microseconds.
 const MAX_LATENCY_US: u64 = 60_000_000;
 
@@ -84,6 +89,37 @@ impl mlua::UserData for WsConn {
     }
 }
 
+/// A gRPC client connection to the echo service, exposed to Luau as a userdata
+/// object with a `:unary(text)` method.
+struct GrpcConn {
+    client: echo::echo_client::EchoClient<tonic::transport::Channel>,
+    stats: Arc<Mutex<VuStats>>,
+}
+
+impl mlua::UserData for GrpcConn {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // grpc:unary(text) -> string — a single request/response call.
+        methods.add_async_method("unary", |_, this, text: String| async move {
+            // Clone the client (cheap; it shares the underlying HTTP/2 channel)
+            // so we can call it without needing &mut on the shared userdata.
+            let mut client = this.client.clone();
+            let start = Instant::now();
+            let outcome = client.unary(echo::EchoMessage { text }).await;
+            let elapsed = start.elapsed();
+            match outcome {
+                Ok(response) => {
+                    this.stats.lock().unwrap().record_request(elapsed, true);
+                    Ok(response.into_inner().text)
+                }
+                Err(status) => {
+                    this.stats.lock().unwrap().record_request(elapsed, false);
+                    Err(mlua::Error::external(status))
+                }
+            }
+        });
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "moonson",
@@ -135,6 +171,12 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:9001")]
         addr: String,
     },
+    /// Run a local gRPC echo server (a reliable target for `grpc.connect`).
+    ServeGrpc {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        addr: String,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +204,7 @@ async fn main() -> Result<()> {
             run_scenario(&script, base_url, vus, duration, timeout).await
         }
         Command::ServeEcho { addr } => serve_echo(addr).await,
+        Command::ServeGrpc { addr } => serve_grpc(addr).await,
     }
 }
 
@@ -411,6 +454,26 @@ async fn run_one_vu(
     )?;
     lua.globals().set("websocket", websocket)?;
 
+    // grpc.connect(url) -> connection object with a :unary(text) method.
+    let grpc_stats = stats.clone();
+    let grpc = lua.create_table()?;
+    grpc.set(
+        "connect",
+        lua.create_async_function(move |lua, url: String| {
+            let grpc_stats = grpc_stats.clone();
+            async move {
+                let client = echo::echo_client::EchoClient::connect(url)
+                    .await
+                    .map_err(mlua::Error::external)?;
+                lua.create_userdata(GrpcConn {
+                    client,
+                    stats: grpc_stats,
+                })
+            }
+        })?,
+    )?;
+    lua.globals().set("grpc", grpc)?;
+
     // think(seconds): pause this VU without blocking the thread.
     let think = lua.create_async_function(|_, seconds: f64| async move {
         tokio::time::sleep(Duration::from_secs_f64(seconds.max(0.0))).await;
@@ -556,6 +619,34 @@ async fn serve_echo(addr: String) -> Result<()> {
             }
         });
     }
+}
+
+/// The echo gRPC service used by `serve-grpc`.
+struct EchoService;
+
+#[tonic::async_trait]
+impl echo::echo_server::Echo for EchoService {
+    async fn unary(
+        &self,
+        request: tonic::Request<echo::EchoMessage>,
+    ) -> Result<tonic::Response<echo::EchoMessage>, tonic::Status> {
+        let text = request.into_inner().text;
+        Ok(tonic::Response::new(echo::EchoMessage { text }))
+    }
+}
+
+/// Run a local gRPC echo server (a reliable target for `grpc.connect`).
+async fn serve_grpc(addr: String) -> Result<()> {
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid address {addr}"))?;
+    println!("gRPC echo server listening on http://{addr} (Ctrl-C to stop)");
+    tonic::transport::Server::builder()
+        .add_service(echo::echo_server::EchoServer::new(EchoService))
+        .serve(socket)
+        .await
+        .context("gRPC server error")?;
+    Ok(())
 }
 
 /// Derive a WebSocket base URL from an HTTP one by swapping the scheme

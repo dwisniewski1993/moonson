@@ -21,3 +21,11 @@ mlua = { workspace = true }
 hdrhistogram = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+# Compiles proto/echo.proto at build time; protoc-bin-vendored ships a protoc
+# binary so no system install is needed.
+tonic-build = "0.12"
+protoc-bin-vendored = "3"

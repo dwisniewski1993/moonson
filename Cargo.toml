@@ -41,6 +41,9 @@ hdrhistogram = "7"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 # Stream/Sink extension traits (.next(), .send()) used to drive the WebSocket.
 futures-util = "0.3"
+# gRPC (M2): tonic is the client+server, prost is the protobuf runtime.
+tonic = "0.12"
+prost = "0.13"
 
 # Release builds: optimise hard. A load generator spends all its time in hot
 # loops, so this matters. (Has no effect on `cargo build`, only `--release`.)
