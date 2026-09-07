@@ -56,6 +56,11 @@ http-body-util = "0.1"
 # protoc), prost-reflect gives runtime descriptors + DynamicMessage.
 protox = "0.7"
 prost-reflect = { version = "0.14", features = ["serde"] }
+# Serde-JSON bridge (Lua table <-> DynamicMessage) plus the low-level HTTP path
+# and byte-buffer traits used by the dynamic gRPC codec.
+serde_json = "1"
+http = "1"
+bytes = "1"
 
 # Release builds: optimise hard. A load generator spends all its time in hot
 # loops, so this matters. (Has no effect on `cargo build`, only `--release`.)

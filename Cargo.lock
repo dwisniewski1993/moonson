@@ -1101,10 +1101,12 @@ name = "moonson-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "futures-channel",
  "futures-util",
  "hdrhistogram",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1114,6 +1116,7 @@ dependencies = [
  "protoc-bin-vendored",
  "protox",
  "reqwest",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tonic",

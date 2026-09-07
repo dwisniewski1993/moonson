@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
-use mlua::{Function, Lua, Table, Value};
+use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 /// gRPC types generated from `proto/echo.proto` at build time (see build.rs).
@@ -173,6 +173,132 @@ impl mlua::UserData for GrpcStream {
             tx.close_channel();
             Ok(())
         });
+    }
+}
+
+/// A dynamic gRPC client: a channel plus a descriptor pool loaded from a
+/// `.proto` at run time, so scenarios can call arbitrary services.
+struct DynGrpcClient {
+    grpc: tonic::client::Grpc<tonic::transport::Channel>,
+    pool: prost_reflect::DescriptorPool,
+    stats: Arc<Mutex<VuStats>>,
+}
+
+impl mlua::UserData for DynGrpcClient {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // client:unary("package.Service/Method", { field = value }) -> table
+        methods.add_async_method(
+            "unary",
+            |lua, this, (method, message): (String, Value)| async move {
+                let (service_name, method_name) = method.split_once('/').ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!(
+                        "gRPC method must be \"Service/Method\", got '{method}'"
+                    ))
+                })?;
+                let service = this.pool.get_service_by_name(service_name).ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!("unknown gRPC service '{service_name}'"))
+                })?;
+                let method_desc = service
+                    .methods()
+                    .find(|m| m.name() == method_name)
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!(
+                            "unknown method '{method_name}' on '{service_name}'"
+                        ))
+                    })?;
+
+                // Lua table -> JSON -> protobuf DynamicMessage (via the descriptor).
+                let json = serde_json::to_value(&message).map_err(mlua::Error::external)?;
+                let request_msg =
+                    prost_reflect::DynamicMessage::deserialize(method_desc.input(), json)
+                        .map_err(mlua::Error::external)?;
+
+                let path = http::uri::PathAndQuery::from_maybe_shared(format!(
+                    "/{service_name}/{method_name}"
+                ))
+                .map_err(mlua::Error::external)?;
+                let codec = DynamicCodec {
+                    output: method_desc.output(),
+                };
+
+                let mut client = this.grpc.clone();
+                client.ready().await.map_err(mlua::Error::external)?;
+                let start = Instant::now();
+                let outcome = client
+                    .unary(tonic::Request::new(request_msg), path, codec)
+                    .await;
+                let elapsed = start.elapsed();
+                match outcome {
+                    Ok(response) => {
+                        this.stats.lock().unwrap().record_request(elapsed, true);
+                        lua.to_value(&response.into_inner())
+                    }
+                    Err(status) => {
+                        this.stats.lock().unwrap().record_request(elapsed, false);
+                        Err(mlua::Error::external(status))
+                    }
+                }
+            },
+        );
+    }
+}
+
+/// A tonic codec that carries prost-reflect `DynamicMessage`s, so calls whose
+/// types are only known at run time can be encoded and decoded.
+struct DynamicCodec {
+    output: prost_reflect::MessageDescriptor,
+}
+
+impl tonic::codec::Codec for DynamicCodec {
+    type Encode = prost_reflect::DynamicMessage;
+    type Decode = prost_reflect::DynamicMessage;
+    type Encoder = DynamicEncoder;
+    type Decoder = DynamicDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        DynamicEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        DynamicDecoder {
+            output: self.output.clone(),
+        }
+    }
+}
+
+struct DynamicEncoder;
+
+impl tonic::codec::Encoder for DynamicEncoder {
+    type Item = prost_reflect::DynamicMessage;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        use bytes::BufMut;
+        use prost::Message;
+        dst.put_slice(&item.encode_to_vec());
+        Ok(())
+    }
+}
+
+struct DynamicDecoder {
+    output: prost_reflect::MessageDescriptor,
+}
+
+impl tonic::codec::Decoder for DynamicDecoder {
+    type Item = prost_reflect::DynamicMessage;
+    type Error = tonic::Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        let message = prost_reflect::DynamicMessage::decode(self.output.clone(), src)
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        Ok(Some(message))
     }
 }
 
@@ -541,6 +667,35 @@ async fn run_one_vu(
             }
         })?,
     )?;
+
+    // grpc.dial(url, proto_path) -> dynamic client with :unary(method, table).
+    let dial_stats = stats.clone();
+    let dial = lua.create_async_function(move |lua, (url, proto): (String, String)| {
+        let dial_stats = dial_stats.clone();
+        async move {
+            let channel = tonic::transport::Channel::from_shared(url)
+                .map_err(mlua::Error::external)?
+                .connect()
+                .await
+                .map_err(mlua::Error::external)?;
+            let proto_path = std::path::PathBuf::from(proto);
+            let include = proto_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let descriptor_set = protox::compile([proto_path.as_path()], [include.as_path()])
+                .map_err(mlua::Error::external)?;
+            let pool = prost_reflect::DescriptorPool::from_file_descriptor_set(descriptor_set)
+                .map_err(mlua::Error::external)?;
+            lua.create_userdata(DynGrpcClient {
+                grpc: tonic::client::Grpc::new(channel),
+                pool,
+                stats: dial_stats,
+            })
+        }
+    })?;
+    grpc.set("dial", dial)?;
+
     lua.globals().set("grpc", grpc)?;
 
     // think(seconds): pause this VU without blocking the thread.
