@@ -1,10 +1,9 @@
 //! moonson — command-line entry point.
 //!
-//! Step 5 completes the walking skeleton. The `run` subcommand now drives a Luau
-//! scenario across N virtual users for a fixed duration: each VU is a spawned
-//! task with its own Lua state, looping the scenario until the deadline. Every
-//! request's latency and outcome is recorded, and the run ends with a report
-//! (requests, throughput, and p50/p95/p99 latency).
+//! M0.1 rounds out the HTTP DSL. Scenarios can now call `http.get`/`http.post`
+//! with headers and a JSON body, assert with `check()`, and pace with `think()`.
+//! Each VU still runs its own Lua state as a coroutine (Step 5); the report now
+//! also shows how many checks passed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hdrhistogram::Histogram;
-use mlua::{Function, Lua};
+use mlua::{Function, Lua, Table, Value};
 
 /// Upper bound for the latency histogram: 60 seconds, expressed in microseconds.
 const MAX_LATENCY_US: u64 = 60_000_000;
@@ -103,6 +102,9 @@ struct VuStats {
     ok: u64,
     /// Transport failures (no response: DNS, connection, TLS...).
     failed: u64,
+    /// `check()` assertions that evaluated true / false.
+    checks_passed: u64,
+    checks_failed: u64,
 }
 
 impl VuStats {
@@ -112,16 +114,26 @@ impl VuStats {
                 .expect("valid histogram bounds"),
             ok: 0,
             failed: 0,
+            checks_passed: 0,
+            checks_failed: 0,
         }
     }
 
-    fn record(&mut self, elapsed: Duration, ok: bool) {
+    fn record_request(&mut self, elapsed: Duration, ok: bool) {
         let micros = (elapsed.as_micros() as u64).clamp(1, MAX_LATENCY_US);
         let _ = self.latency.record(micros);
         if ok {
             self.ok += 1;
         } else {
             self.failed += 1;
+        }
+    }
+
+    fn record_check(&mut self, passed: bool) {
+        if passed {
+            self.checks_passed += 1;
+        } else {
+            self.checks_failed += 1;
         }
     }
 }
@@ -217,6 +229,8 @@ async fn run_scenario(
         Histogram::<u64>::new_with_bounds(1, MAX_LATENCY_US, 3).expect("valid histogram bounds");
     let mut ok = 0u64;
     let mut failed = 0u64;
+    let mut checks_passed = 0u64;
+    let mut checks_failed = 0u64;
     for stats in &all_stats {
         let stats = stats.lock().unwrap();
         latency
@@ -224,6 +238,8 @@ async fn run_scenario(
             .expect("histograms share bounds");
         ok += stats.ok;
         failed += stats.failed;
+        checks_passed += stats.checks_passed;
+        checks_failed += stats.checks_failed;
     }
 
     let total = ok + failed;
@@ -239,11 +255,15 @@ async fn run_scenario(
         latency.value_at_quantile(0.99) as f64 / 1000.0,
         latency.max() as f64 / 1000.0,
     );
+    let checks_total = checks_passed + checks_failed;
+    if checks_total > 0 {
+        println!("checks: {checks_passed}/{checks_total} passed");
+    }
     Ok(())
 }
 
-/// One virtual user: build its own Lua state, load the scenario, and loop it
-/// until the deadline, recording each request into `stats`.
+/// One virtual user: build its own Lua state, register the DSL, load the
+/// scenario, and loop it until the deadline.
 async fn run_one_vu(
     vu_id: u32,
     source: String,
@@ -254,37 +274,50 @@ async fn run_one_vu(
 ) -> Result<()> {
     let lua = Lua::new();
 
-    // http.get(path) -> { status }: real async request, timed and recorded.
+    // http.get(path[, opts]) and http.post(path[, opts]). Both return
+    // { status = <number> }; opts may carry `json` and `headers`.
     let http = lua.create_table()?;
-    http.set(
-        "get",
-        lua.create_async_function(move |lua, path: String| {
+    for (name, method) in [
+        ("get", reqwest::Method::GET),
+        ("post", reqwest::Method::POST),
+    ] {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        let stats = stats.clone();
+        let function = lua.create_async_function(move |lua, (path, opts): (String, Option<Table>)| {
             let client = client.clone();
             let base_url = base_url.clone();
             let stats = stats.clone();
-            async move {
-                let url = format!("{base_url}{path}");
-                let start = Instant::now();
-                let outcome = client.get(&url).send().await;
-                let elapsed = start.elapsed();
-
-                let result = lua.create_table()?;
-                match outcome {
-                    Ok(response) => {
-                        let status = response.status().as_u16();
-                        stats.lock().unwrap().record(elapsed, true);
-                        result.set("status", status)?;
-                    }
-                    Err(_error) => {
-                        stats.lock().unwrap().record(elapsed, false);
-                        result.set("status", 0)?; // 0 = transport error, no response
-                    }
-                }
-                Ok(result)
-            }
-        })?,
-    )?;
+            let method = method.clone();
+            async move { perform_request(lua, client, base_url, stats, method, path, opts).await }
+        })?;
+        http.set(name, function)?;
+    }
     lua.globals().set("http", http)?;
+
+    // think(seconds): pause this VU without blocking the thread.
+    let think = lua.create_async_function(|_, seconds: f64| async move {
+        tokio::time::sleep(Duration::from_secs_f64(seconds.max(0.0))).await;
+        Ok(())
+    })?;
+    lua.globals().set("think", think)?;
+
+    // check(response, { name = boolean, ... }): tally each named assertion and
+    // return whether all passed. The booleans are evaluated in Lua before the
+    // call, so we just count them.
+    let check_stats = stats.clone();
+    let check = lua.create_function(move |_, (_response, checks): (Table, Table)| {
+        let mut all_passed = true;
+        for pair in checks.pairs::<String, bool>() {
+            let (_name, passed) = pair?;
+            check_stats.lock().unwrap().record_check(passed);
+            if !passed {
+                all_passed = false;
+            }
+        }
+        Ok(all_passed)
+    })?;
+    lua.globals().set("check", check)?;
 
     // scenario(name, body): stash the body so we can loop it after loading.
     let slot: Arc<Mutex<Option<Function>>> = Arc::new(Mutex::new(None));
@@ -310,6 +343,53 @@ async fn run_one_vu(
         let _: () = body.call_async(vu_id).await?;
     }
     Ok(())
+}
+
+/// Send one HTTP request described by a scenario call, record it, and return a
+/// `{ status }` table to the script.
+async fn perform_request(
+    lua: Lua,
+    client: reqwest::Client,
+    base_url: String,
+    stats: Arc<Mutex<VuStats>>,
+    method: reqwest::Method,
+    path: String,
+    opts: Option<Table>,
+) -> mlua::Result<Table> {
+    let url = format!("{base_url}{path}");
+    let mut request = client.request(method, url);
+
+    if let Some(opts) = opts {
+        let json: Option<Value> = opts.get("json")?;
+        if let Some(json) = json {
+            request = request.json(&json);
+        }
+        let headers: Option<Table> = opts.get("headers")?;
+        if let Some(headers) = headers {
+            for pair in headers.pairs::<String, String>() {
+                let (name, value) = pair?;
+                request = request.header(name.as_str(), value.as_str());
+            }
+        }
+    }
+
+    let start = Instant::now();
+    let outcome = request.send().await;
+    let elapsed = start.elapsed();
+
+    let result = lua.create_table()?;
+    match outcome {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            stats.lock().unwrap().record_request(elapsed, true);
+            result.set("status", status)?;
+        }
+        Err(_error) => {
+            stats.lock().unwrap().record_request(elapsed, false);
+            result.set("status", 0)?; // 0 = transport error, no response
+        }
+    }
+    Ok(result)
 }
 
 /// Turn a string like "10s" into a `Duration`. Supports `ms`, `s`, and `m`.
@@ -362,17 +442,26 @@ mod tests {
 
     #[test]
     fn vustats_records_and_merges() {
-        // Metrics plumbing, tested without any network.
         let mut a = VuStats::new();
-        a.record(Duration::from_millis(10), true);
-        a.record(Duration::from_millis(20), false);
+        a.record_request(Duration::from_millis(10), true);
+        a.record_request(Duration::from_millis(20), false);
         let mut b = VuStats::new();
-        b.record(Duration::from_millis(30), true);
+        b.record_request(Duration::from_millis(30), true);
 
         a.latency.add(&b.latency).unwrap();
         assert_eq!(a.ok, 1);
         assert_eq!(a.failed, 1);
-        assert_eq!(a.latency.len(), 3); // three recorded samples in total
+        assert_eq!(a.latency.len(), 3);
+    }
+
+    #[test]
+    fn vustats_counts_checks() {
+        let mut s = VuStats::new();
+        s.record_check(true);
+        s.record_check(false);
+        s.record_check(true);
+        assert_eq!(s.checks_passed, 2);
+        assert_eq!(s.checks_failed, 1);
     }
 
     #[test]
@@ -420,8 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_host_function_runs_inside_a_coroutine() {
-        // The async bridge, tested without network: an async host function that
-        // yields then returns a value, called from a Luau coroutine.
+        // The async bridge, tested without network.
         let lua = Lua::new();
         let answer = lua
             .create_async_function(|_, ()| async move {

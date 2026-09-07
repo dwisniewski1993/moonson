@@ -38,6 +38,11 @@ print the report.
 **Check:** `moonson run examples/smoke.luau --vus 100 --duration 10s` prints
 requests, RPS, p50/p95/p99, and errors.
 
+### M0.1 — finish the HTTP DSL
+`http.post` with a JSON body and headers, optional headers on `http.get`,
+`check()` for assertions, and `think()` for pacing — so `examples/smoke.luau`
+runs for real and the report includes a checks line.
+
 ## After M0
 
 - **M1 — WebSocket** (wedge #2)

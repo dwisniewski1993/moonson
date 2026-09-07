@@ -1,14 +1,21 @@
--- The scenario we are building toward. None of this runs yet — it is the target
--- shape of the DSL, kept here so the docs and the code stay honest about the
--- goal. Steps 3-5 make it real.
+-- A realistic-looking flow that actually runs against the default base URL
+-- (https://httpbin.org). All three endpoints return 200, so the check passes.
+--
+--   cargo run --release -p moonson-cli -- run examples/smoke.luau --vus 5 --duration 10s
+--
+-- Note: think(1) paces each virtual user to ~1 iteration/second, so this
+-- demonstrates the DSL rather than raw throughput.
 
 scenario("login_flow", function(vu)
-  http.get("/login")
+  http.get("/get")
 
-  local r = http.post("/auth", { json = { user = "test", pass = "123" } })
-  check(r, { ["status is 200"] = r.status == 200 })
+  local r = http.post("/post", {
+    json = { user = "test", pass = "123" },
+    headers = { ["X-Demo"] = "moonson" },
+  })
+  check(r, { ["auth status is 200"] = r.status == 200 })
 
-  think(1) -- pretend the user reads the page for a second
+  think(1)
 
-  http.get("/dashboard")
+  http.get("/status/200")
 end)
