@@ -511,23 +511,48 @@ async fn perform_request(
 /// A tiny local WebSocket echo server, so `run` scenarios have a reliable target
 /// that does not depend on a public host being reachable.
 async fn serve_echo(addr: String) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("cannot bind {addr}"))?;
-    println!("echo server listening on ws://{addr} (Ctrl-C to stop)");
+    println!("echo server listening on http+ws://{addr} (Ctrl-C to stop)");
     loop {
-        let (stream, _peer) = listener.accept().await.context("accept failed")?;
+        let (mut stream, _peer) = listener.accept().await.context("accept failed")?;
         tokio::spawn(async move {
-            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
-                return;
+            // Peek at the request without consuming it, so we can tell a
+            // WebSocket upgrade apart from a plain HTTP request on the same port.
+            let mut head = [0u8; 1024];
+            let n = match stream.peek(&mut head).await {
+                Ok(n) => n,
+                Err(_) => return,
             };
-            while let Some(Ok(message)) = ws.next().await {
-                if message.is_close() {
-                    break;
+            let is_ws = String::from_utf8_lossy(&head[..n])
+                .to_ascii_lowercase()
+                .contains("sec-websocket-key");
+
+            if is_ws {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = ws.next().await {
+                    if message.is_close() {
+                        break;
+                    }
+                    if (message.is_text() || message.is_binary()) && ws.send(message).await.is_err()
+                    {
+                        break;
+                    }
                 }
-                if (message.is_text() || message.is_binary()) && ws.send(message).await.is_err() {
-                    break;
-                }
+            } else {
+                // Drain the request first: closing a socket that still has
+                // unread bytes makes the OS send an RST, which the client sees as
+                // an error. Then reply 200 OK and close cleanly.
+                let mut sink = [0u8; 8192];
+                let _ = stream.read(&mut sink).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
         });
     }

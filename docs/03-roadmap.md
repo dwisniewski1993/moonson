@@ -45,7 +45,7 @@ runs for real and the report includes a checks line.
 
 ## After M0
 
-- **M1 — WebSocket** (wedge #2) — in progress: connect/send/recv/close + WS metrics
+- **M1 — WebSocket** (wedge #2) — connect/send/recv/close, WS metrics, HTTP+WS in one VU
 - **M2 — gRPC streaming** (wedge #2)
 - **M3 — Density benchmark & fast path** (wedge #1)
 - **M4 — Observability, data feeds, ramp profiles**
