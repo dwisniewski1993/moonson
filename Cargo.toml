@@ -31,8 +31,11 @@ clap = { version = "4", features = ["derive"] }
 # (first build needs a C++ compiler; on macOS: Xcode Command Line Tools). `send`
 # makes Lua values Send, which (a) lets mlua::Error convert through anyhow's `?`
 # and (b) lets us move a Lua state into a spawned task per VU in Step 5. The
-# `async` feature arrives in Step 4.
-mlua = { version = "0.10", features = ["luau", "send"] }
+# `async` feature bridges Luau coroutines to Rust futures.
+mlua = { version = "0.10", features = ["luau", "send", "async"] }
+# High-dynamic-range histogram for accurate latency percentiles (p95/p99) at a
+# small, fixed memory cost.
+hdrhistogram = "7"
 
 # Release builds: optimise hard. A load generator spends all its time in hot
 # loops, so this matters. (Has no effect on `cargo build`, only `--release`.)

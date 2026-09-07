@@ -21,13 +21,13 @@ Spawn N async tasks that loop the request for D seconds; count them.
 **Teaches:** `tokio::spawn`, `Arc`, atomic counters, `tokio::time`.
 **Check:** `... --vus 50 --duration 5s <url>` prints total requests and req/s.
 
-### Step 3 — Embed Luau
+### Step 3 — Embed Luau  ✅
 Load a `.luau` file, register a `scenario(name, fn)` function, run its body once
 with a stub `http.get`.
 **Teaches:** embedding a scripting VM, exposing Rust functions to a script.
 **Check:** a script calling `http.get("/")` makes Rust log the call.
 
-### Step 4 — The async bridge (the crux)
+### Step 4 — The async bridge (the crux)  ✅
 Make `http.get` a real async host function; run the scenario as a coroutine so
 the script can `await` real HTTP without blocking. Proves the whole DSL model.
 **Check:** the script performs a real GET and reads `r.status`; `check()` works.

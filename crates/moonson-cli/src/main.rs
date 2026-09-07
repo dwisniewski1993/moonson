@@ -1,15 +1,14 @@
 //! moonson — command-line entry point.
 //!
-//! Step 3 embeds the Luau scripting engine. The CLI now has two subcommands:
-//! `load` runs the raw request loop from Step 2 (N VUs for a duration), and
-//! `run` loads a `.luau` scenario file and executes it once. For now the
-//! `http.get` that a scenario calls is a stub that only logs; Step 4 turns it
-//! into a real asynchronous request.
+//! Step 4 makes the scripting bridge real. `http.get` is now an asynchronous
+//! host function that performs an actual HTTP request, and the scenario body is
+//! run as a coroutine (`call_async`) so it can await that request without
+//! blocking the thread. This is the proof that the whole DSL model works.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -41,10 +40,13 @@ enum Command {
         #[arg(long, default_value = "5s")]
         duration: String,
     },
-    /// Run a Luau scenario file once (I/O is still stubbed in this step).
+    /// Run a Luau scenario file once, performing real HTTP requests.
     Run {
         /// Path to a .luau scenario file.
         script: PathBuf,
+        /// Base URL that scenario paths (e.g. "/get") are joined onto.
+        #[arg(long, default_value = "https://httpbin.org")]
+        base_url: String,
     },
 }
 
@@ -55,11 +57,11 @@ async fn main() -> Result<()> {
             let duration = parse_duration(&duration)?;
             run_load(url, vus, duration).await
         }
-        Command::Run { script } => run_script(&script),
+        Command::Run { script, base_url } => run_script(&script, base_url).await,
     }
 }
 
-/// Raw request loop (Step 2), now living behind the `load` subcommand.
+/// Raw request loop (Step 2), behind the `load` subcommand.
 async fn run_load(url: String, vus: u32, duration: Duration) -> Result<()> {
     println!("Running {vus} VU(s) against {url} for {duration:?}...");
 
@@ -97,45 +99,72 @@ async fn run_load(url: String, vus: u32, duration: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Load a `.luau` file and run the scenario it defines, once.
+/// Run a Luau scenario file once, performing real asynchronous HTTP requests.
 ///
-/// This is the first time Rust and the script talk to each other. We expose two
-/// things to the script — an `http` table with a `get` function, and a
-/// `scenario(name, body)` function — then loading the file runs its top-level
-/// code, which calls `scenario(...)`, which calls the body back.
-fn run_script(path: &Path) -> Result<()> {
+/// Two things are new versus Step 3. First, `http.get` is now an async host
+/// function (`create_async_function`) that actually sends the request and
+/// returns a `{ status = ... }` table. Second, the scenario body runs with
+/// `call_async` — as a coroutine — so when it calls `http.get` the coroutine
+/// suspends and awaits the request instead of blocking the thread.
+async fn run_script(path: &Path, base_url: String) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read scenario file {}", path.display()))?;
 
     let lua = Lua::new();
+    let client = reqwest::Client::new();
 
-    // `http.get(url)` — a stub host function that only logs the call for now.
+    // http.get(path) -> { status = <number> }. A real async request; the base
+    // URL is prepended so scenarios can use short paths like "/get".
     let http = lua.create_table()?;
+    let get_client = client.clone();
+    let get_base = base_url.clone();
     http.set(
         "get",
-        lua.create_function(|_, url: String| {
-            println!("  http.get {url}");
-            Ok(())
+        lua.create_async_function(move |lua, path: String| {
+            // These clones are moved into the future so it owns everything it
+            // needs (it must be `'static`).
+            let client = get_client.clone();
+            let base = get_base.clone();
+            async move {
+                let url = format!("{base}{path}");
+                let response = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(mlua::Error::external)?;
+                let result = lua.create_table()?;
+                result.set("status", response.status().as_u16())?;
+                Ok(result)
+            }
         })?,
     )?;
     lua.globals().set("http", http)?;
 
-    // `scenario(name, body)` — register a scenario and run it once immediately,
-    // passing a placeholder virtual-user id. Real scheduling arrives in Step 5.
+    // scenario(name, body): remember the scenario so we can run it (async) after
+    // the file finishes loading. We stash it in a shared slot because the host
+    // function only gets shared access to its surroundings.
+    let slot: Arc<Mutex<Option<(String, Function)>>> = Arc::new(Mutex::new(None));
+    let store = slot.clone();
     lua.globals().set(
         "scenario",
-        lua.create_function(|_, (name, body): (String, Function)| {
-            println!("scenario \"{name}\" running...");
-            let _: () = body.call(1)?;
+        lua.create_function(move |_, (name, body): (String, Function)| {
+            *store.lock().unwrap() = Some((name, body));
             Ok(())
         })?,
     )?;
 
-    // Running the file triggers the `scenario(...)` call inside it.
+    // Loading the file runs its top-level code, which calls scenario(...).
     lua.load(source.as_str())
         .exec()
-        .with_context(|| format!("error while running {}", path.display()))?;
+        .with_context(|| format!("error while loading {}", path.display()))?;
 
+    // Run the stored scenario as a coroutine, driving its async http.get calls.
+    let scenario = slot.lock().unwrap().take();
+    let (name, body) =
+        scenario.context("script defined no scenario; call scenario(name, function() ... end)")?;
+    println!("scenario \"{name}\" running against {base_url}...");
+    let _: () = body.call_async(1).await?;
+    println!("done.");
     Ok(())
 }
 
@@ -189,9 +218,8 @@ mod tests {
 
     #[test]
     fn scenario_calls_http_get_for_each_call() {
-        // A self-contained check of the Rust <-> Luau round-trip: a script that
-        // calls http.get twice should invoke our host function twice. No files,
-        // no network.
+        // Sync round-trip check (no async, no network): a script that calls
+        // http.get twice should invoke our host function twice.
         let lua = Lua::new();
         let calls = Arc::new(AtomicU64::new(0));
 
@@ -230,5 +258,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn async_host_function_runs_inside_a_coroutine() {
+        // The crux of Step 4, tested without any network: an async host function
+        // that yields and then returns a value, called from a Luau coroutine via
+        // `call_async`.
+        let lua = Lua::new();
+        let answer = lua
+            .create_async_function(|_, ()| async move {
+                tokio::task::yield_now().await;
+                Ok(42_i64)
+            })
+            .unwrap();
+        lua.globals().set("answer", answer).unwrap();
+
+        let scenario: Function = lua
+            .load(
+                r#"
+                return function()
+                  return answer()
+                end
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        let result: i64 = scenario.call_async(()).await.unwrap();
+        assert_eq!(result, 42);
     }
 }
