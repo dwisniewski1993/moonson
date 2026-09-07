@@ -39,8 +39,11 @@ hdrhistogram = "7"
 # WebSocket client (M1). native-tls matches reqwest's default TLS backend so wss
 # works with no extra setup.
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-# Stream/Sink extension traits (.next(), .send()) used to drive the WebSocket.
+# Stream/Sink extension traits (.next(), .send()) used to drive WS and gRPC.
 futures-util = "0.3"
+# mpsc channel whose Receiver is a Stream and Sender is a Sink (the `sink`
+# feature) — feeds the gRPC bidi request stream.
+futures-channel = { version = "0.3", features = ["sink"] }
 # gRPC (M2): tonic is the client+server, prost is the protobuf runtime.
 tonic = "0.12"
 prost = "0.13"

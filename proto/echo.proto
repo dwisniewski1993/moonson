@@ -2,11 +2,12 @@ syntax = "proto3";
 
 package echo;
 
-// A minimal service for exercising moonson's gRPC support. Step 1 covers the
-// unary call; a streaming RPC is added in the next step.
+// A minimal service for exercising moonson's gRPC support.
 service Echo {
   // Unary echo: returns the same text it was given.
   rpc Unary(EchoMessage) returns (EchoMessage);
+  // Bidirectional streaming echo: every message sent is echoed straight back.
+  rpc Stream(stream EchoMessage) returns (stream EchoMessage);
 }
 
 message EchoMessage {

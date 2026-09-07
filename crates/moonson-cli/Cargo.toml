@@ -21,6 +21,7 @@ mlua = { workspace = true }
 hdrhistogram = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+futures-channel = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 

@@ -50,7 +50,7 @@ impl mlua::UserData for WsConn {
             };
             drop(guard);
             result.map_err(mlua::Error::external)?;
-            this.stats.lock().unwrap().ws_sent += 1;
+            this.stats.lock().unwrap().stream_sent += 1;
             Ok(())
         });
 
@@ -64,7 +64,7 @@ impl mlua::UserData for WsConn {
             drop(guard);
             match next {
                 Some(Ok(message)) => {
-                    this.stats.lock().unwrap().ws_recv += 1;
+                    this.stats.lock().unwrap().stream_recv += 1;
                     let text = match message {
                         Message::Text(t) => t.as_str().to_owned(),
                         Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -116,6 +116,62 @@ impl mlua::UserData for GrpcConn {
                     Err(mlua::Error::external(status))
                 }
             }
+        });
+
+        // grpc:stream() -> a bidi stream object with :send/:recv/:close.
+        methods.add_async_method("stream", |lua, this, ()| async move {
+            let mut client = this.client.clone();
+            // The outbound half is fed from an mpsc channel: `tx` (kept in the
+            // stream object) pushes messages that tonic sends to the server.
+            let (tx, rx) = futures_channel::mpsc::channel::<echo::EchoMessage>(128);
+            let response = client.stream(rx).await.map_err(mlua::Error::external)?;
+            lua.create_userdata(GrpcStream {
+                tx,
+                inbound: tokio::sync::Mutex::new(response.into_inner()),
+                stats: this.stats.clone(),
+            })
+        });
+    }
+}
+
+/// An open gRPC bidirectional stream, exposed to Luau with :send/:recv/:close.
+struct GrpcStream {
+    tx: futures_channel::mpsc::Sender<echo::EchoMessage>,
+    inbound: tokio::sync::Mutex<tonic::Streaming<echo::EchoMessage>>,
+    stats: Arc<Mutex<VuStats>>,
+}
+
+impl mlua::UserData for GrpcStream {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_async_method("send", |_, this, text: String| async move {
+            let mut tx = this.tx.clone();
+            tx.send(echo::EchoMessage { text })
+                .await
+                .map_err(mlua::Error::external)?;
+            this.stats.lock().unwrap().stream_sent += 1;
+            Ok(())
+        });
+
+        methods.add_async_method("recv", |_, this, ()| async move {
+            let mut inbound = this.inbound.lock().await;
+            let next = inbound.next().await;
+            drop(inbound);
+            match next {
+                Some(Ok(message)) => {
+                    this.stats.lock().unwrap().stream_recv += 1;
+                    Ok(Some(message.text))
+                }
+                Some(Err(e)) => Err(mlua::Error::external(e)),
+                None => Ok(None),
+            }
+        });
+
+        methods.add_async_method("close", |_, this, ()| async move {
+            // Closing the sender ends the outbound half; the server then ends the
+            // inbound half in response.
+            let mut tx = this.tx.clone();
+            tx.close_channel();
+            Ok(())
         });
     }
 }
@@ -220,9 +276,9 @@ struct VuStats {
     /// `check()` assertions that evaluated true / false.
     checks_passed: u64,
     checks_failed: u64,
-    /// WebSocket messages sent / received.
-    ws_sent: u64,
-    ws_recv: u64,
+    /// Streaming messages (WebSocket or gRPC) sent / received.
+    stream_sent: u64,
+    stream_recv: u64,
 }
 
 impl VuStats {
@@ -234,8 +290,8 @@ impl VuStats {
             failed: 0,
             checks_passed: 0,
             checks_failed: 0,
-            ws_sent: 0,
-            ws_recv: 0,
+            stream_sent: 0,
+            stream_recv: 0,
         }
     }
 
@@ -311,7 +367,7 @@ async fn run_scenario(
         .with_context(|| format!("cannot read scenario file {}", path.display()))?;
 
     println!(
-        "Running {} with {vus} VU(s) for {duration:?} against {base_url}...",
+        "Running {} with {vus} VU(s) for {duration:?}...",
         path.display()
     );
 
@@ -351,8 +407,8 @@ async fn run_scenario(
     let mut failed = 0u64;
     let mut checks_passed = 0u64;
     let mut checks_failed = 0u64;
-    let mut ws_sent = 0u64;
-    let mut ws_recv = 0u64;
+    let mut stream_sent = 0u64;
+    let mut stream_recv = 0u64;
     for stats in &all_stats {
         let stats = stats.lock().unwrap();
         latency
@@ -362,8 +418,8 @@ async fn run_scenario(
         failed += stats.failed;
         checks_passed += stats.checks_passed;
         checks_failed += stats.checks_failed;
-        ws_sent += stats.ws_sent;
-        ws_recv += stats.ws_recv;
+        stream_sent += stats.stream_sent;
+        stream_recv += stats.stream_recv;
     }
 
     let total = ok + failed;
@@ -385,8 +441,8 @@ async fn run_scenario(
     if checks_total > 0 {
         println!("checks: {checks_passed}/{checks_total} passed");
     }
-    if ws_sent > 0 || ws_recv > 0 {
-        println!("websocket: sent {ws_sent}  received {ws_recv}");
+    if stream_sent > 0 || stream_recv > 0 {
+        println!("stream messages: sent {stream_sent}  received {stream_recv}");
     }
     Ok(())
 }
@@ -632,6 +688,24 @@ impl echo::echo_server::Echo for EchoService {
     ) -> Result<tonic::Response<echo::EchoMessage>, tonic::Status> {
         let text = request.into_inner().text;
         Ok(tonic::Response::new(echo::EchoMessage { text }))
+    }
+
+    type StreamStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<Item = Result<echo::EchoMessage, tonic::Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<echo::EchoMessage>>,
+    ) -> Result<tonic::Response<Self::StreamStream>, tonic::Status> {
+        // Echo: forward every message from the inbound stream straight back out.
+        let inbound = request.into_inner();
+        let outbound: Self::StreamStream = Box::pin(inbound);
+        Ok(tonic::Response::new(outbound))
     }
 }
 
