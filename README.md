@@ -4,8 +4,9 @@ A modern, high-density **load testing tool**: a fast execution engine written in
 **Rust**, driven by test scenarios written in **Luau** (a small, fast, typed
 scripting language).
 
-> **Status: pre-alpha.** Being built in the open, step by step. Not usable yet —
-> follow [`docs/03-roadmap.md`](docs/03-roadmap.md).
+> **Status: early, but working.** HTTP and WebSocket load tests run today (see
+> below); gRPC and the density work are next. Progress in
+> [`docs/03-roadmap.md`](docs/03-roadmap.md).
 
 ## Why another load testing tool?
 
@@ -33,18 +34,33 @@ end)
 ```
 
 ```
-moonson run examples/smoke.luau --vus 100 --duration 30s
+moonson run examples/smoke.luau --vus 20 --duration 30s
 ```
 
-(Neither works yet — that is the target we are building toward.)
+WebSocket works too — a scenario can hold a long-lived socket and even mix it
+with HTTP in the same virtual user:
+
+```lua
+scenario("mixed", function(vu)
+  http.get("/login")
+  local ws = websocket.connect("/stream")
+  ws:send("hello")
+  local reply = ws:recv()
+  check(reply, { ["got a reply"] = reply ~= nil })
+  ws:close()
+end)
+```
+
+See [`examples/`](examples/) for runnable scenarios.
 
 ## Build & run
 
 Install the Rust toolchain from https://rustup.rs, then:
 
 ```
-cargo build                  # compile
-cargo run -p moonson-cli     # run the CLI (prints a banner for now)
+cargo build                                          # compile
+cargo run -p moonson-cli -- run examples/smoke.luau  # run a scenario
+cargo run -p moonson-cli -- serve-echo               # local HTTP+WS echo for testing
 ```
 
 ## Documentation
