@@ -98,6 +98,27 @@ much lighter, and faster under high concurrency). At extreme VU counts the
 current per-VU model erodes the memory edge — a clear, measured optimization
 target, not a dead end.
 
+## Attribution: where the per-VU memory goes (M3)
+
+To decide *what* to optimise, compare the scripted path (`run`, one Lua state per
+VU) with the raw path (`load`, plain reqwest, no Lua) at 1000 VUs against the same
+target:
+
+| 1000 VUs        | req/s   | peak RSS |
+|-----------------|---------|----------|
+| `run` (Lua)     | 114,532 | 709 MB   |
+| `load` (no Lua) | 133,083 | 176 MB   |
+
+So the HTTP stack (reqwest + tokio + 1000 keep-alive connections) accounts for
+~176 MB (~0.16 MB/VU plus base), and the Lua layer accounts for the other
+**~533 MB — about 0.53 MB/VU, ~73% of the per-VU cost** — plus ~15% of throughput.
+The optimisation target is therefore the per-VU Lua state, not the HTTP stack.
+
+The fix: stop giving every VU its own full Lua state. Share **one Lua state per
+worker thread**, register the host functions and load the scenario once per
+thread, and run the VUs as **coroutines** on it (a few KB each) instead of full
+states (~0.5 MB each). This is the OpenResty model and matches ADR-0001.
+
 ## Interpreting the outcome
 
 - **req/s similar:** expected for HTTP — the wedge is not raw throughput. Fine.
