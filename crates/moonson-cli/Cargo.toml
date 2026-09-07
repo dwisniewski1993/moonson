@@ -24,6 +24,9 @@ futures-util = { workspace = true }
 futures-channel = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
 
 [build-dependencies]
 # Compiles proto/echo.proto at build time; protoc-bin-vendored ships a protoc

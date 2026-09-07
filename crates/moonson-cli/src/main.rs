@@ -233,6 +233,12 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: String,
     },
+    /// Run a minimal fast HTTP server, used as the target for benchmarks.
+    ServeBench {
+        /// Address to listen on.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+    },
 }
 
 #[tokio::main]
@@ -261,6 +267,7 @@ async fn main() -> Result<()> {
         }
         Command::ServeEcho { addr } => serve_echo(addr).await,
         Command::ServeGrpc { addr } => serve_grpc(addr).await,
+        Command::ServeBench { addr } => serve_bench(addr).await,
     }
 }
 
@@ -721,6 +728,34 @@ async fn serve_grpc(addr: String) -> Result<()> {
         .await
         .context("gRPC server error")?;
     Ok(())
+}
+
+/// A minimal, fast, keep-alive HTTP server that answers every request with
+/// `200 ok`. Used as the benchmark target so we measure the load *generators*,
+/// not the target.
+async fn serve_bench(addr: String) -> Result<()> {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::service::service_fn;
+    use hyper::Response;
+    use hyper_util::rt::TokioIo;
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("cannot bind {addr}"))?;
+    println!("bench target listening on http://{addr} (Ctrl-C to stop)");
+    loop {
+        let (stream, _peer) = listener.accept().await.context("accept failed")?;
+        let io = TokioIo::new(stream);
+        tokio::spawn(async move {
+            let service = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+    }
 }
 
 /// Derive a WebSocket base URL from an HTTP one by swapping the scheme

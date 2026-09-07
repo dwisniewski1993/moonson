@@ -47,7 +47,7 @@ runs for real and the report includes a checks line.
 
 - **M1 — WebSocket** (wedge #2) ✅ — connect/send/recv/close, WS metrics, HTTP+WS in one VU
 - **M2 — gRPC** (wedge #2) — unary + bidi streaming + built-in echo server
-- **M3 — Density benchmark & fast path** (wedge #1)
+- **M3 — Density benchmark & fast path** (wedge #1) — in progress: harness + `serve-bench` vs k6
 - **M4 — Observability, data feeds, ramp profiles**
 
 We revisit and rewrite this file as we learn. That is expected, not a failure.
