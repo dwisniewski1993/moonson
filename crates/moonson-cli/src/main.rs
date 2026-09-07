@@ -30,37 +30,55 @@ type WsStream =
 /// lives behind an async mutex so the `:send`/`:recv`/`:close` methods (which
 /// only get shared access to `self`) can still drive it.
 struct WsConn {
-    stream: tokio::sync::Mutex<WsStream>,
+    stream: tokio::sync::Mutex<Option<WsStream>>,
+    stats: Arc<Mutex<VuStats>>,
 }
 
 impl mlua::UserData for WsConn {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         // ws:send(text) — send a text frame.
         methods.add_async_method("send", |_, this, text: String| async move {
-            let mut stream = this.stream.lock().await;
-            stream
-                .send(Message::Text(text))
-                .await
-                .map_err(mlua::Error::external)?;
+            let mut guard = this.stream.lock().await;
+            let result = match guard.as_mut() {
+                Some(stream) => stream.send(Message::Text(text)).await,
+                None => return Err(mlua::Error::RuntimeError("websocket is closed".into())),
+            };
+            drop(guard);
+            result.map_err(mlua::Error::external)?;
+            this.stats.lock().unwrap().ws_sent += 1;
             Ok(())
         });
 
         // ws:recv() -> string | nil — wait for the next message; nil if closed.
         methods.add_async_method("recv", |_, this, ()| async move {
-            let mut stream = this.stream.lock().await;
-            match stream.next().await {
-                Some(Ok(Message::Text(t))) => Ok(Some(t.as_str().to_owned())),
-                Some(Ok(Message::Binary(b))) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
-                Some(Ok(_)) => Ok(Some(String::new())), // ping/pong/close control frames
+            let mut guard = this.stream.lock().await;
+            let next = match guard.as_mut() {
+                Some(stream) => stream.next().await,
+                None => None,
+            };
+            drop(guard);
+            match next {
+                Some(Ok(message)) => {
+                    this.stats.lock().unwrap().ws_recv += 1;
+                    let text = match message {
+                        Message::Text(t) => t.as_str().to_owned(),
+                        Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                        _ => String::new(), // ping/pong/close control frames
+                    };
+                    Ok(Some(text))
+                }
                 Some(Err(e)) => Err(mlua::Error::external(e)),
                 None => Ok(None),
             }
         });
 
-        // ws:close() — close the connection.
+        // ws:close() — finish the close handshake and DROP the socket so its file
+        // descriptor is freed immediately (crucial when looping many connections).
         methods.add_async_method("close", |_, this, ()| async move {
-            let mut stream = this.stream.lock().await;
-            stream.close(None).await.map_err(mlua::Error::external)?;
+            let mut guard = this.stream.lock().await;
+            if let Some(mut stream) = guard.take() {
+                let _ = stream.close(None).await;
+            }
             Ok(())
         });
     }
@@ -159,6 +177,9 @@ struct VuStats {
     /// `check()` assertions that evaluated true / false.
     checks_passed: u64,
     checks_failed: u64,
+    /// WebSocket messages sent / received.
+    ws_sent: u64,
+    ws_recv: u64,
 }
 
 impl VuStats {
@@ -170,6 +191,8 @@ impl VuStats {
             failed: 0,
             checks_passed: 0,
             checks_failed: 0,
+            ws_sent: 0,
+            ws_recv: 0,
         }
     }
 
@@ -285,6 +308,8 @@ async fn run_scenario(
     let mut failed = 0u64;
     let mut checks_passed = 0u64;
     let mut checks_failed = 0u64;
+    let mut ws_sent = 0u64;
+    let mut ws_recv = 0u64;
     for stats in &all_stats {
         let stats = stats.lock().unwrap();
         latency
@@ -294,6 +319,8 @@ async fn run_scenario(
         failed += stats.failed;
         checks_passed += stats.checks_passed;
         checks_failed += stats.checks_failed;
+        ws_sent += stats.ws_sent;
+        ws_recv += stats.ws_recv;
     }
 
     let total = ok + failed;
@@ -314,6 +341,9 @@ async fn run_scenario(
     let checks_total = checks_passed + checks_failed;
     if checks_total > 0 {
         println!("checks: {checks_passed}/{checks_total} passed");
+    }
+    if ws_sent > 0 || ws_recv > 0 {
+        println!("websocket: sent {ws_sent}  received {ws_recv}");
     }
     Ok(())
 }
@@ -356,11 +386,13 @@ async fn run_one_vu(
 
     // websocket.connect(path) -> connection object with :send/:recv/:close.
     let ws_base = to_ws_base(&base_url);
+    let ws_stats = stats.clone();
     let websocket = lua.create_table()?;
     websocket.set(
         "connect",
         lua.create_async_function(move |lua, path: String| {
             let ws_base = ws_base.clone();
+            let ws_stats = ws_stats.clone();
             async move {
                 let url = if path.starts_with("ws://") || path.starts_with("wss://") {
                     path
@@ -371,7 +403,8 @@ async fn run_one_vu(
                     .await
                     .map_err(mlua::Error::external)?;
                 lua.create_userdata(WsConn {
-                    stream: tokio::sync::Mutex::new(stream),
+                    stream: tokio::sync::Mutex::new(Some(stream)),
+                    stats: ws_stats,
                 })
             }
         })?,
