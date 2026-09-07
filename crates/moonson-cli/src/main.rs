@@ -240,6 +240,90 @@ impl mlua::UserData for DynGrpcClient {
                 }
             },
         );
+
+        // client:stream("package.Service/Method") -> bidi stream object.
+        methods.add_async_method("stream", |lua, this, method: String| async move {
+            let (service_name, method_name) = method.split_once('/').ok_or_else(|| {
+                mlua::Error::RuntimeError(format!(
+                    "gRPC method must be \"Service/Method\", got '{method}'"
+                ))
+            })?;
+            let service = this.pool.get_service_by_name(service_name).ok_or_else(|| {
+                mlua::Error::RuntimeError(format!("unknown gRPC service '{service_name}'"))
+            })?;
+            let method_desc = service
+                .methods()
+                .find(|m| m.name() == method_name)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError(format!(
+                        "unknown method '{method_name}' on '{service_name}'"
+                    ))
+                })?;
+            let path = http::uri::PathAndQuery::from_maybe_shared(format!(
+                "/{service_name}/{method_name}"
+            ))
+            .map_err(mlua::Error::external)?;
+            let codec = DynamicCodec {
+                output: method_desc.output(),
+            };
+            let (tx, rx) = futures_channel::mpsc::channel::<prost_reflect::DynamicMessage>(128);
+            let mut client = this.grpc.clone();
+            client.ready().await.map_err(mlua::Error::external)?;
+            let response = client
+                .streaming(tonic::Request::new(rx), path, codec)
+                .await
+                .map_err(mlua::Error::external)?;
+            lua.create_userdata(DynGrpcStream {
+                tx,
+                inbound: tokio::sync::Mutex::new(response.into_inner()),
+                input: method_desc.input(),
+                stats: this.stats.clone(),
+            })
+        });
+    }
+}
+
+/// A gRPC bidirectional stream over a dynamic `.proto`, exposed to Luau with
+/// :send/:recv/:close.
+struct DynGrpcStream {
+    tx: futures_channel::mpsc::Sender<prost_reflect::DynamicMessage>,
+    inbound: tokio::sync::Mutex<tonic::Streaming<prost_reflect::DynamicMessage>>,
+    input: prost_reflect::MessageDescriptor,
+    stats: Arc<Mutex<VuStats>>,
+}
+
+impl mlua::UserData for DynGrpcStream {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_async_method("send", |_, this, message: Value| async move {
+            let json = serde_json::to_value(&message).map_err(mlua::Error::external)?;
+            let msg = prost_reflect::DynamicMessage::deserialize(this.input.clone(), json)
+                .map_err(mlua::Error::external)?;
+            let mut tx = this.tx.clone();
+            tx.send(msg).await.map_err(mlua::Error::external)?;
+            this.stats.lock().unwrap().stream_sent += 1;
+            Ok(())
+        });
+
+        methods.add_async_method("recv", |lua, this, ()| async move {
+            let mut inbound = this.inbound.lock().await;
+            let next = inbound.next().await;
+            drop(inbound);
+            match next {
+                Some(Ok(message)) => {
+                    this.stats.lock().unwrap().stream_recv += 1;
+                    let value = lua.to_value(&message)?;
+                    Ok(Some(value))
+                }
+                Some(Err(status)) => Err(mlua::Error::external(status)),
+                None => Ok(None),
+            }
+        });
+
+        methods.add_async_method("close", |_, this, ()| async move {
+            let mut tx = this.tx.clone();
+            tx.close_channel();
+            Ok(())
+        });
     }
 }
 

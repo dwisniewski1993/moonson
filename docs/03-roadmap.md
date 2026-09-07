@@ -46,8 +46,9 @@ runs for real and the report includes a checks line.
 ## After M0
 
 - **M1 — WebSocket** (wedge #2) ✅ — connect/send/recv/close, WS metrics, HTTP+WS in one VU
-- **M2 — gRPC** (wedge #2) ✅ *(partial)* — unary + bidi streaming + built-in echo
-  server; general **dynamic `.proto`** loading still to do
+- **M2 — gRPC** (wedge #2) ✅ — typed unary/bidi echo + **dynamic `.proto`** unary
+  (`grpc.dial` / `:unary`) against any service; dynamic *streaming* is the one
+  optional extra left
 - **M3 — Density** (wedge #1) — benchmark vs k6 ✅ (see
   [`benchmarks/density.md`](benchmarks/density.md)); **fast path + Lua-state
   pooling** (cut the ~0.72 MB/VU) still to do
