@@ -461,6 +461,10 @@ enum Command {
         /// Report format.
         #[arg(long, value_enum, default_value = "text")]
         out: OutputFormat,
+        /// Serve live Prometheus metrics at this address during the run,
+        /// e.g. 127.0.0.1:9100.
+        #[arg(long)]
+        prometheus: Option<String>,
     },
     /// Run a local WebSocket echo server (a reliable target for `run` scenarios).
     ServeEcho {
@@ -494,6 +498,17 @@ enum OutputFormat {
     Json,
 }
 
+/// Options for a scenario run, bundled to keep `run_scenario`'s signature small.
+struct RunConfig {
+    base_url: String,
+    vus: u32,
+    duration: Duration,
+    timeout: Duration,
+    stages: Option<Vec<Stage>>,
+    out: OutputFormat,
+    prometheus: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -515,11 +530,18 @@ async fn main() -> Result<()> {
             timeout,
             stages,
             out,
+            prometheus,
         } => {
-            let duration = parse_duration(&duration)?;
-            let timeout = parse_duration(&timeout)?;
-            let stages = stages.map(|s| parse_stages(&s)).transpose()?;
-            run_scenario(&script, base_url, vus, duration, timeout, stages, out).await
+            let config = RunConfig {
+                base_url,
+                vus,
+                duration: parse_duration(&duration)?,
+                timeout: parse_duration(&timeout)?,
+                stages: stages.map(|s| parse_stages(&s)).transpose()?,
+                out,
+                prometheus,
+            };
+            run_scenario(&script, config).await
         }
         Command::ServeEcho { addr } => serve_echo(addr).await,
         Command::ServeGrpc { addr } => serve_grpc(addr).await,
@@ -620,15 +642,16 @@ async fn run_load(url: String, vus: u32, duration: Duration, timeout: Duration) 
 }
 
 /// Drive a Luau scenario across `vus` virtual users for `duration`, then report.
-async fn run_scenario(
-    path: &Path,
-    base_url: String,
-    vus: u32,
-    duration: Duration,
-    timeout: Duration,
-    stages: Option<Vec<Stage>>,
-    out: OutputFormat,
-) -> Result<()> {
+async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
+    let RunConfig {
+        base_url,
+        vus,
+        duration,
+        timeout,
+        stages,
+        out,
+        prometheus,
+    } = config;
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read scenario file {}", path.display()))?;
 
@@ -723,10 +746,29 @@ async fn run_scenario(
         }));
     }
 
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("a worker thread panicked"))??;
+    // Optional live Prometheus endpoint, served while the test runs.
+    if let Some(addr) = prometheus {
+        let socket: std::net::SocketAddr = addr
+            .parse()
+            .with_context(|| format!("invalid --prometheus address {addr}"))?;
+        tokio::spawn(serve_metrics(socket, worker_stats.clone()));
+        if matches!(out, OutputFormat::Text) {
+            println!("Prometheus metrics on http://{socket}/metrics");
+        }
+    }
+
+    // Join the worker threads. join() is blocking, so run it off the async
+    // runtime (which may be serving /metrics concurrently).
+    let results = tokio::task::spawn_blocking(move || {
+        handles
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("failed to join worker threads")?;
+    for result in results {
+        result.map_err(|_| anyhow::anyhow!("a worker thread panicked"))??;
     }
 
     // Merge every VU's histogram and counters into a single view.
@@ -1206,6 +1248,86 @@ fn to_ws_base(base_url: &str) -> String {
         format!("ws{rest}")
     } else {
         base_url.to_owned()
+    }
+}
+
+/// Aggregate the workers' stats into Prometheus text-format metrics.
+fn render_metrics(worker_stats: &[Arc<Mutex<VuStats>>]) -> String {
+    let mut latency =
+        Histogram::<u64>::new_with_bounds(1, MAX_LATENCY_US, 3).expect("valid histogram bounds");
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    let mut checks_passed = 0u64;
+    let mut checks_failed = 0u64;
+    let mut stream_sent = 0u64;
+    let mut stream_recv = 0u64;
+    for stats in worker_stats {
+        let stats = stats.lock().unwrap();
+        let _ = latency.add(&stats.latency);
+        ok += stats.ok;
+        failed += stats.failed;
+        checks_passed += stats.checks_passed;
+        checks_failed += stats.checks_failed;
+        stream_sent += stats.stream_sent;
+        stream_recv += stats.stream_recv;
+    }
+    let total = ok + failed;
+    let p50 = latency.value_at_quantile(0.50) as f64 / 1000.0;
+    let p95 = latency.value_at_quantile(0.95) as f64 / 1000.0;
+    let p99 = latency.value_at_quantile(0.99) as f64 / 1000.0;
+    format!(
+        "# TYPE moonson_requests_total counter\n\
+         moonson_requests_total {total}\n\
+         # TYPE moonson_requests_ok_total counter\n\
+         moonson_requests_ok_total {ok}\n\
+         # TYPE moonson_requests_failed_total counter\n\
+         moonson_requests_failed_total {failed}\n\
+         # TYPE moonson_checks_passed_total counter\n\
+         moonson_checks_passed_total {checks_passed}\n\
+         # TYPE moonson_checks_failed_total counter\n\
+         moonson_checks_failed_total {checks_failed}\n\
+         # TYPE moonson_stream_sent_total counter\n\
+         moonson_stream_sent_total {stream_sent}\n\
+         # TYPE moonson_stream_received_total counter\n\
+         moonson_stream_received_total {stream_recv}\n\
+         # TYPE moonson_latency_p50_ms gauge\n\
+         moonson_latency_p50_ms {p50}\n\
+         # TYPE moonson_latency_p95_ms gauge\n\
+         moonson_latency_p95_ms {p95}\n\
+         # TYPE moonson_latency_p99_ms gauge\n\
+         moonson_latency_p99_ms {p99}\n"
+    )
+}
+
+/// Serve live metrics at `/metrics` for Prometheus to scrape during a run.
+async fn serve_metrics(addr: std::net::SocketAddr, worker_stats: Vec<Arc<Mutex<VuStats>>>) {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::service::service_fn;
+    use hyper::Response;
+    use hyper_util::rt::TokioIo;
+
+    let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
+        eprintln!("could not bind Prometheus endpoint on {addr}");
+        return;
+    };
+    loop {
+        let Ok((stream, _peer)) = listener.accept().await else {
+            continue;
+        };
+        let worker_stats = worker_stats.clone();
+        let io = TokioIo::new(stream);
+        tokio::spawn(async move {
+            let service = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                let body = render_metrics(&worker_stats);
+                async move {
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(body))))
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
     }
 }
 

@@ -53,6 +53,7 @@ runs for real and the report includes a checks line.
   throughput ~40%; at 1000 VUs moonson is now ~5x lighter and ~70% faster than k6
   (see [`benchmarks/density.md`](benchmarks/density.md))
 - **M4 — ergonomics & observability** — ramp-up stages ✅ (`--stages`),
-  JSON report ✅ (`--out json`); data feeds (CSV) and Prometheus export still to do
+  JSON report ✅ (`--out json`), CSV data feeds ✅ (`data.open`); Prometheus
+  export still to do
 
 We revisit and rewrite this file as we learn. That is expected, not a failure.
