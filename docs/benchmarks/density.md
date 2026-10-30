@@ -119,6 +119,26 @@ worker thread**, register the host functions and load the scenario once per
 thread, and run the VUs as **coroutines** on it (a few KB each) instead of full
 states (~0.5 MB each). This is the OpenResty model and matches ADR-0001.
 
+## After the M3 optimization (shared Lua state per worker)
+
+Replacing one Lua state per VU with one shared state per worker thread (VUs as
+coroutines) changed the numbers decisively. At 1000 VUs against the same target:
+
+| 1000 VUs                | req/s   | peak RSS |
+|-------------------------|---------|----------|
+| `run` before (state/VU) | 114,532 | 709 MB   |
+| `run` after (shared)    | 160,810 | 133 MB   |
+| k6                      |  93,961 | 681 MB   |
+
+Memory fell ~5x (709 → 133 MB — now even below the no-Lua `load` baseline of
+176 MB, because there are a handful of worker tasks instead of 1000), and
+throughput rose ~40% (the per-request VM / registration overhead is gone). The
+per-VU Lua cost dropped from ~0.72 MB to under ~0.1 MB.
+
+Net: against k6 at 1000 VUs, moonson is now ~5x lighter **and** ~70% faster, and
+because its memory barely grows with VUs while k6's stays ~640–710 MB, the
+earlier crossover disappears across the tested range. Wedge #1 holds outright.
+
 ## Interpreting the outcome
 
 - **req/s similar:** expected for HTTP — the wedge is not raw throughput. Fine.

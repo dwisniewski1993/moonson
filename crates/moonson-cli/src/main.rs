@@ -594,33 +594,62 @@ async fn run_scenario(
         path.display()
     );
 
-    // One client shared by all VUs, so they share the connection pool.
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("failed to build HTTP client")?;
     let deadline = Instant::now() + duration;
 
-    // Spawn one task per VU. We keep a handle to each VU's stats so we can merge
-    // them once every task has finished.
-    let mut handles = Vec::with_capacity(vus as usize);
-    let mut all_stats = Vec::with_capacity(vus as usize);
-    for vu_id in 0..vus {
+    // One worker thread per CPU (never more than there are VUs). Each worker owns
+    // ONE Lua state and runs its slice of the VUs as coroutines on it, so a VU
+    // costs a coroutine (a few KB), not a whole Lua state (~0.5 MB).
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(vus.max(1) as usize);
+
+    let mut worker_stats: Vec<Arc<Mutex<VuStats>>> = Vec::with_capacity(worker_count);
+    let mut handles = Vec::with_capacity(worker_count);
+    for w in 0..worker_count {
+        // Give this worker a contiguous slice of VU ids.
+        let first = (vus as usize * w / worker_count) as u32;
+        let last = (vus as usize * (w + 1) / worker_count) as u32;
         let stats = Arc::new(Mutex::new(VuStats::new()));
-        all_stats.push(stats.clone());
-        handles.push(tokio::spawn(run_one_vu(
-            vu_id,
-            source.clone(),
-            base_url.clone(),
-            client.clone(),
-            stats,
-            deadline,
-        )));
+        worker_stats.push(stats.clone());
+        let source = source.clone();
+        let base_url = base_url.clone();
+        handles.push(std::thread::spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build worker runtime")?;
+            tokio::task::LocalSet::new().block_on(&runtime, async move {
+                let client = reqwest::Client::builder()
+                    .timeout(timeout)
+                    .build()
+                    .context("failed to build HTTP client")?;
+                let (lua, body) = build_scenario(&source, base_url, client, stats)?;
+                let mut tasks = Vec::with_capacity((last - first) as usize);
+                for vu_id in first..last {
+                    let body = body.clone();
+                    tasks.push(tokio::task::spawn_local(async move {
+                        while Instant::now() < deadline {
+                            let _: () = body.call_async(vu_id).await?;
+                        }
+                        Ok::<(), mlua::Error>(())
+                    }));
+                }
+                for task in tasks {
+                    task.await.context("a virtual user task panicked")??;
+                }
+                // Drop the scenario body before the Lua state it lives in.
+                drop(body);
+                drop(lua);
+                Ok(())
+            })
+        }));
     }
+
     for handle in handles {
-        // First `?`: the task did not panic. Second `?`: the scenario inside it
-        // did not return an error.
-        handle.await.context("a virtual user task panicked")??;
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("a worker thread panicked"))??;
     }
 
     // Merge every VU's histogram and counters into a single view.
@@ -632,7 +661,7 @@ async fn run_scenario(
     let mut checks_failed = 0u64;
     let mut stream_sent = 0u64;
     let mut stream_recv = 0u64;
-    for stats in &all_stats {
+    for stats in &worker_stats {
         let stats = stats.lock().unwrap();
         latency
             .add(&stats.latency)
@@ -670,16 +699,16 @@ async fn run_scenario(
     Ok(())
 }
 
-/// One virtual user: build its own Lua state, register the DSL, load the
-/// scenario, and loop it until the deadline.
-async fn run_one_vu(
-    vu_id: u32,
-    source: String,
+/// Build a VU execution environment: a fresh Lua state with the `http`,
+/// `websocket`, `grpc`, `think`, and `check` host functions registered and the
+/// scenario loaded, returning the scenario body. One of these is shared by all
+/// the VUs (coroutines) on a worker thread.
+fn build_scenario(
+    source: &str,
     base_url: String,
     client: reqwest::Client,
     stats: Arc<Mutex<VuStats>>,
-    deadline: Instant,
-) -> Result<()> {
+) -> Result<(Lua, Function)> {
     let lua = Lua::new();
 
     // http.get(path[, opts]) and http.post(path[, opts]). Both return
@@ -817,7 +846,7 @@ async fn run_one_vu(
         })?,
     )?;
 
-    lua.load(source.as_str())
+    lua.load(source)
         .exec()
         .context("error while loading scenario")?;
     let body = slot
@@ -826,10 +855,7 @@ async fn run_one_vu(
         .take()
         .context("script defined no scenario; call scenario(name, function() ... end)")?;
 
-    while Instant::now() < deadline {
-        let _: () = body.call_async(vu_id).await?;
-    }
-    Ok(())
+    Ok((lua, body))
 }
 
 /// Send one HTTP request described by a scenario call, record it, and return a

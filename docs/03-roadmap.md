@@ -48,10 +48,10 @@ runs for real and the report includes a checks line.
 - **M1 — WebSocket** (wedge #2) ✅ — connect/send/recv/close, WS metrics, HTTP+WS in one VU
 - **M2 — gRPC** (wedge #2) ✅ — dynamic `.proto` via `grpc.dial`: unary **and**
   bidi streaming against any service, built from Lua tables
-- **M3 — Density** (wedge #1) — benchmark vs k6 ✅ + attribution ✅ (Lua is
-  ~0.53 MB/VU = 73% of per-VU cost); **fix: one shared Lua state per worker thread,
-  VUs as coroutines** — still to build (see
-  [`benchmarks/density.md`](benchmarks/density.md))
+- **M3 — Density** (wedge #1) ✅ — benchmark + attribution + fix: one shared Lua
+  state per worker thread (VUs as coroutines) cut per-VU memory ~7x and raised
+  throughput ~40%; at 1000 VUs moonson is now ~5x lighter and ~70% faster than k6
+  (see [`benchmarks/density.md`](benchmarks/density.md))
 - **M4 — Observability, data feeds, ramp profiles**
 
 We revisit and rewrite this file as we learn. That is expected, not a failure.
