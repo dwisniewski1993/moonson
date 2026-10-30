@@ -565,6 +565,8 @@ struct VuStats {
     /// Streaming messages (WebSocket or gRPC) sent / received.
     stream_sent: u64,
     stream_recv: u64,
+    /// Iterations that raised an error (counted, not fatal).
+    iteration_errors: u64,
 }
 
 impl VuStats {
@@ -578,6 +580,7 @@ impl VuStats {
             checks_failed: 0,
             stream_sent: 0,
             stream_recv: 0,
+            iteration_errors: 0,
         }
     }
 
@@ -711,11 +714,13 @@ async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
                     .timeout(timeout)
                     .build()
                     .context("failed to build HTTP client")?;
+                let loop_stats = stats.clone();
                 let (lua, body) = build_scenario(&source, base_url, client, stats)?;
                 let mut tasks = Vec::with_capacity((last - first) as usize);
                 for vu_id in first..last {
                     let body = body.clone();
                     let schedule = schedule.clone();
+                    let loop_stats = loop_stats.clone();
                     tasks.push(tokio::task::spawn_local(async move {
                         while Instant::now() < deadline {
                             // Under a ramp, a VU generates load only while its id
@@ -727,7 +732,12 @@ async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
                                 None => true,
                             };
                             if active {
-                                let _: () = body.call_async(vu_id).await?;
+                                // A failing iteration is counted, not fatal: the
+                                // VU records the error and keeps going.
+                                let result: mlua::Result<()> = body.call_async(vu_id).await;
+                                if result.is_err() {
+                                    loop_stats.lock().unwrap().iteration_errors += 1;
+                                }
                             } else {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }
@@ -780,6 +790,7 @@ async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
     let mut checks_failed = 0u64;
     let mut stream_sent = 0u64;
     let mut stream_recv = 0u64;
+    let mut iteration_errors = 0u64;
     for stats in &worker_stats {
         let stats = stats.lock().unwrap();
         latency
@@ -791,6 +802,7 @@ async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
         checks_failed += stats.checks_failed;
         stream_sent += stats.stream_sent;
         stream_recv += stats.stream_recv;
+        iteration_errors += stats.iteration_errors;
     }
 
     let total = ok + failed;
@@ -814,6 +826,7 @@ async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
                 "latency_ms": { "p50": p50, "p95": p95, "p99": p99, "max": max_ms },
                 "checks": { "passed": checks_passed, "total": checks_total },
                 "stream_messages": { "sent": stream_sent, "received": stream_recv },
+                "iteration_errors": iteration_errors,
             });
             println!(
                 "{}",
@@ -832,6 +845,9 @@ async fn run_scenario(path: &Path, config: RunConfig) -> Result<()> {
             }
             if stream_sent > 0 || stream_recv > 0 {
                 println!("stream messages: sent {stream_sent}  received {stream_recv}");
+            }
+            if iteration_errors > 0 {
+                println!("iteration errors: {iteration_errors}");
             }
         }
     }
@@ -1261,6 +1277,7 @@ fn render_metrics(worker_stats: &[Arc<Mutex<VuStats>>]) -> String {
     let mut checks_failed = 0u64;
     let mut stream_sent = 0u64;
     let mut stream_recv = 0u64;
+    let mut iteration_errors = 0u64;
     for stats in worker_stats {
         let stats = stats.lock().unwrap();
         let _ = latency.add(&stats.latency);
@@ -1270,6 +1287,7 @@ fn render_metrics(worker_stats: &[Arc<Mutex<VuStats>>]) -> String {
         checks_failed += stats.checks_failed;
         stream_sent += stats.stream_sent;
         stream_recv += stats.stream_recv;
+        iteration_errors += stats.iteration_errors;
     }
     let total = ok + failed;
     let p50 = latency.value_at_quantile(0.50) as f64 / 1000.0;
@@ -1290,6 +1308,8 @@ fn render_metrics(worker_stats: &[Arc<Mutex<VuStats>>]) -> String {
          moonson_stream_sent_total {stream_sent}\n\
          # TYPE moonson_stream_received_total counter\n\
          moonson_stream_received_total {stream_recv}\n\
+         # TYPE moonson_iteration_errors_total counter\n\
+         moonson_iteration_errors_total {iteration_errors}\n\
          # TYPE moonson_latency_p50_ms gauge\n\
          moonson_latency_p50_ms {p50}\n\
          # TYPE moonson_latency_p95_ms gauge\n\
