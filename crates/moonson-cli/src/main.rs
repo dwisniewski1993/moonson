@@ -430,6 +430,9 @@ enum Command {
         /// Per-request timeout: e.g. 5s, 500ms.
         #[arg(long, default_value = "30s")]
         timeout: String,
+        /// Ramp schedule, e.g. "30s:50,1m:50,10s:0" (overrides --vus/--duration).
+        #[arg(long)]
+        stages: Option<String>,
     },
     /// Run a local WebSocket echo server (a reliable target for `run` scenarios).
     ServeEcho {
@@ -475,10 +478,12 @@ async fn main() -> Result<()> {
             vus,
             duration,
             timeout,
+            stages,
         } => {
             let duration = parse_duration(&duration)?;
             let timeout = parse_duration(&timeout)?;
-            run_scenario(&script, base_url, vus, duration, timeout).await
+            let stages = stages.map(|s| parse_stages(&s)).transpose()?;
+            run_scenario(&script, base_url, vus, duration, timeout, stages).await
         }
         Command::ServeEcho { addr } => serve_echo(addr).await,
         Command::ServeGrpc { addr } => serve_grpc(addr).await,
@@ -585,16 +590,35 @@ async fn run_scenario(
     vus: u32,
     duration: Duration,
     timeout: Duration,
+    stages: Option<Vec<Stage>>,
 ) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read scenario file {}", path.display()))?;
 
-    println!(
-        "Running {} with {vus} VU(s) for {duration:?}...",
-        path.display()
-    );
+    // A ramp schedule (stages) or a constant number of VUs for a duration.
+    let (max_vus, total_duration, schedule) = match stages {
+        Some(stages) => {
+            let max_vus = stages.iter().map(|s| s.target).max().unwrap_or(0);
+            let total: Duration = stages.iter().map(|s| s.duration).sum();
+            (max_vus, total, Some(Arc::new(stages)))
+        }
+        None => (vus, duration, None),
+    };
 
-    let deadline = Instant::now() + duration;
+    if schedule.is_some() {
+        println!(
+            "Running {} with up to {max_vus} VU(s) over {total_duration:?} (ramp)...",
+            path.display()
+        );
+    } else {
+        println!(
+            "Running {} with {max_vus} VU(s) for {total_duration:?}...",
+            path.display()
+        );
+    }
+
+    let start = Instant::now();
+    let deadline = start + total_duration;
 
     // One worker thread per CPU (never more than there are VUs). Each worker owns
     // ONE Lua state and runs its slice of the VUs as coroutines on it, so a VU
@@ -602,18 +626,19 @@ async fn run_scenario(
     let worker_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(vus.max(1) as usize);
+        .min(max_vus.max(1) as usize);
 
     let mut worker_stats: Vec<Arc<Mutex<VuStats>>> = Vec::with_capacity(worker_count);
     let mut handles = Vec::with_capacity(worker_count);
     for w in 0..worker_count {
         // Give this worker a contiguous slice of VU ids.
-        let first = (vus as usize * w / worker_count) as u32;
-        let last = (vus as usize * (w + 1) / worker_count) as u32;
+        let first = (max_vus as usize * w / worker_count) as u32;
+        let last = (max_vus as usize * (w + 1) / worker_count) as u32;
         let stats = Arc::new(Mutex::new(VuStats::new()));
         worker_stats.push(stats.clone());
         let source = source.clone();
         let base_url = base_url.clone();
+        let schedule = schedule.clone();
         handles.push(std::thread::spawn(move || -> Result<()> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -628,9 +653,22 @@ async fn run_scenario(
                 let mut tasks = Vec::with_capacity((last - first) as usize);
                 for vu_id in first..last {
                     let body = body.clone();
+                    let schedule = schedule.clone();
                     tasks.push(tokio::task::spawn_local(async move {
                         while Instant::now() < deadline {
-                            let _: () = body.call_async(vu_id).await?;
+                            // Under a ramp, a VU generates load only while its id
+                            // is below the current target; otherwise it idles.
+                            let active = match &schedule {
+                                Some(stages) => {
+                                    (f64::from(vu_id)) < target_vus(stages, start.elapsed())
+                                }
+                                None => true,
+                            };
+                            if active {
+                                let _: () = body.call_async(vu_id).await?;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
                         }
                         Ok::<(), mlua::Error>(())
                     }));
@@ -1086,6 +1124,56 @@ fn to_ws_base(base_url: &str) -> String {
     }
 }
 
+/// One stage of a ramp schedule: move the active VU count to `target` over
+/// `duration`, linearly from the previous stage's target.
+struct Stage {
+    duration: Duration,
+    target: u32,
+}
+
+/// Parse a ramp schedule like "30s:50,1m:50,10s:0" into stages.
+fn parse_stages(s: &str) -> Result<Vec<Stage>> {
+    let mut stages = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let (dur, target) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("a stage must be \"<duration>:<vus>\", got '{part}'"))?;
+        stages.push(Stage {
+            duration: parse_duration(dur.trim())?,
+            target: target
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid VU count in stage '{part}'"))?,
+        });
+    }
+    if stages.is_empty() {
+        bail!("no stages given");
+    }
+    Ok(stages)
+}
+
+/// The target active VU count at `elapsed` into the run, interpolating linearly
+/// between stage targets (starting from 0).
+fn target_vus(stages: &[Stage], elapsed: Duration) -> f64 {
+    let mut prev_target = 0.0;
+    let mut stage_start = Duration::ZERO;
+    for stage in stages {
+        let stage_end = stage_start + stage.duration;
+        if elapsed < stage_end {
+            let frac = if stage.duration.is_zero() {
+                1.0
+            } else {
+                (elapsed - stage_start).as_secs_f64() / stage.duration.as_secs_f64()
+            };
+            return prev_target + (f64::from(stage.target) - prev_target) * frac;
+        }
+        prev_target = f64::from(stage.target);
+        stage_start = stage_end;
+    }
+    prev_target
+}
+
 /// Turn a string like "10s" into a `Duration`. Supports `ms`, `s`, and `m`.
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
@@ -1132,6 +1220,27 @@ mod tests {
     #[test]
     fn rejects_unknown_unit() {
         assert!(parse_duration("10h").is_err());
+    }
+
+    #[test]
+    fn parses_stages() {
+        let stages = parse_stages("30s:50,1m:100").unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].duration, Duration::from_secs(30));
+        assert_eq!(stages[0].target, 50);
+        assert_eq!(stages[1].target, 100);
+    }
+
+    #[test]
+    fn ramps_linearly_between_targets() {
+        let stages = vec![Stage {
+            duration: Duration::from_secs(10),
+            target: 100,
+        }];
+        assert!(target_vus(&stages, Duration::from_secs(0)) < 1.0);
+        assert!((target_vus(&stages, Duration::from_secs(5)) - 50.0).abs() < 1.0);
+        // At/after the end, it holds the final target.
+        assert!((target_vus(&stages, Duration::from_secs(10)) - 100.0).abs() < 1.0);
     }
 
     #[test]
