@@ -386,6 +386,31 @@ impl tonic::codec::Decoder for DynamicDecoder {
     }
 }
 
+/// A CSV data set loaded once and shared by a worker's VUs. `:next()` hands out
+/// rows round-robin (wrapping), so iterations get different data.
+struct DataSet {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl mlua::UserData for DataSet {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // data_set:next() -> table keyed by column name (nil if the file is empty).
+        methods.add_method("next", |lua, this, ()| {
+            if this.rows.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let index = this.cursor.fetch_add(1, Ordering::Relaxed) % this.rows.len();
+            let row = lua.create_table()?;
+            for (name, value) in this.headers.iter().zip(&this.rows[index]) {
+                row.set(name.as_str(), value.as_str())?;
+            }
+            Ok(Value::Table(row))
+        });
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "moonson",
@@ -906,6 +931,32 @@ fn build_scenario(
         Ok(all_passed)
     })?;
     lua.globals().set("check", check)?;
+
+    // data.open("file.csv") -> data set with :next() returning the next row.
+    let data = lua.create_table()?;
+    data.set(
+        "open",
+        lua.create_function(|lua, path: String| {
+            let mut reader = csv::Reader::from_path(&path).map_err(mlua::Error::external)?;
+            let headers = reader
+                .headers()
+                .map_err(mlua::Error::external)?
+                .iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for record in reader.records() {
+                let record = record.map_err(mlua::Error::external)?;
+                rows.push(record.iter().map(String::from).collect::<Vec<_>>());
+            }
+            lua.create_userdata(DataSet {
+                headers,
+                rows,
+                cursor: std::sync::atomic::AtomicUsize::new(0),
+            })
+        })?,
+    )?;
+    lua.globals().set("data", data)?;
 
     // scenario(name, body): stash the body so we can loop it after loading.
     let slot: Arc<Mutex<Option<Function>>> = Arc::new(Mutex::new(None));

@@ -61,6 +61,8 @@ prost-reflect = { version = "0.14", features = ["serde"] }
 serde_json = "1"
 http = "1"
 bytes = "1"
+# CSV parsing for data-driven scenarios (data.open).
+csv = "1"
 
 # Release builds: optimise hard. A load generator spends all its time in hot
 # loops, so this matters. (Has no effect on `cargo build`, only `--release`.)
