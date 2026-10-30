@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
@@ -433,6 +433,9 @@ enum Command {
         /// Ramp schedule, e.g. "30s:50,1m:50,10s:0" (overrides --vus/--duration).
         #[arg(long)]
         stages: Option<String>,
+        /// Report format.
+        #[arg(long, value_enum, default_value = "text")]
+        out: OutputFormat,
     },
     /// Run a local WebSocket echo server (a reliable target for `run` scenarios).
     ServeEcho {
@@ -459,6 +462,13 @@ enum Command {
     },
 }
 
+/// How to print the end-of-run report.
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -479,11 +489,12 @@ async fn main() -> Result<()> {
             duration,
             timeout,
             stages,
+            out,
         } => {
             let duration = parse_duration(&duration)?;
             let timeout = parse_duration(&timeout)?;
             let stages = stages.map(|s| parse_stages(&s)).transpose()?;
-            run_scenario(&script, base_url, vus, duration, timeout, stages).await
+            run_scenario(&script, base_url, vus, duration, timeout, stages, out).await
         }
         Command::ServeEcho { addr } => serve_echo(addr).await,
         Command::ServeGrpc { addr } => serve_grpc(addr).await,
@@ -591,6 +602,7 @@ async fn run_scenario(
     duration: Duration,
     timeout: Duration,
     stages: Option<Vec<Stage>>,
+    out: OutputFormat,
 ) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("cannot read scenario file {}", path.display()))?;
@@ -605,16 +617,18 @@ async fn run_scenario(
         None => (vus, duration, None),
     };
 
-    if schedule.is_some() {
-        println!(
-            "Running {} with up to {max_vus} VU(s) over {total_duration:?} (ramp)...",
-            path.display()
-        );
-    } else {
-        println!(
-            "Running {} with {max_vus} VU(s) for {total_duration:?}...",
-            path.display()
-        );
+    if matches!(out, OutputFormat::Text) {
+        if schedule.is_some() {
+            println!(
+                "Running {} with up to {max_vus} VU(s) over {total_duration:?} (ramp)...",
+                path.display()
+            );
+        } else {
+            println!(
+                "Running {} with {max_vus} VU(s) for {total_duration:?}...",
+                path.display()
+            );
+        }
     }
 
     let start = Instant::now();
@@ -713,26 +727,46 @@ async fn run_scenario(
     }
 
     let total = ok + failed;
-    let secs = duration.as_secs_f64();
+    let secs = total_duration.as_secs_f64();
     let rps = if secs > 0.0 { total as f64 / secs } else { 0.0 };
-    println!("---");
-    println!("requests: {total}   ok: {ok}   errors: {failed}");
-    println!("throughput: {rps:.0} req/s");
-    if total > 0 {
-        println!(
-            "latency (ms): p50 {:.1}  p95 {:.1}  p99 {:.1}  max {:.1}",
-            latency.value_at_quantile(0.50) as f64 / 1000.0,
-            latency.value_at_quantile(0.95) as f64 / 1000.0,
-            latency.value_at_quantile(0.99) as f64 / 1000.0,
-            latency.max() as f64 / 1000.0,
-        );
-    }
     let checks_total = checks_passed + checks_failed;
-    if checks_total > 0 {
-        println!("checks: {checks_passed}/{checks_total} passed");
-    }
-    if stream_sent > 0 || stream_recv > 0 {
-        println!("stream messages: sent {stream_sent}  received {stream_recv}");
+    let p50 = latency.value_at_quantile(0.50) as f64 / 1000.0;
+    let p95 = latency.value_at_quantile(0.95) as f64 / 1000.0;
+    let p99 = latency.value_at_quantile(0.99) as f64 / 1000.0;
+    let max_ms = latency.max() as f64 / 1000.0;
+
+    match out {
+        OutputFormat::Json => {
+            let report = serde_json::json!({
+                "vus": max_vus,
+                "duration_secs": secs,
+                "requests": total,
+                "ok": ok,
+                "errors": failed,
+                "throughput_rps": rps,
+                "latency_ms": { "p50": p50, "p95": p95, "p99": p99, "max": max_ms },
+                "checks": { "passed": checks_passed, "total": checks_total },
+                "stream_messages": { "sent": stream_sent, "received": stream_recv },
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("serialize report")
+            );
+        }
+        OutputFormat::Text => {
+            println!("---");
+            println!("requests: {total}   ok: {ok}   errors: {failed}");
+            println!("throughput: {rps:.0} req/s");
+            if total > 0 {
+                println!("latency (ms): p50 {p50:.1}  p95 {p95:.1}  p99 {p99:.1}  max {max_ms:.1}");
+            }
+            if checks_total > 0 {
+                println!("checks: {checks_passed}/{checks_total} passed");
+            }
+            if stream_sent > 0 || stream_recv > 0 {
+                println!("stream messages: sent {stream_sent}  received {stream_recv}");
+            }
+        }
     }
     Ok(())
 }
