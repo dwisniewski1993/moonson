@@ -52,8 +52,8 @@ runs for real and the report includes a checks line.
   state per worker thread (VUs as coroutines) cut per-VU memory ~7x and raised
   throughput ~40%; at 1000 VUs moonson is now ~5x lighter and ~70% faster than k6
   (see [`benchmarks/density.md`](benchmarks/density.md))
-- **M4 — ergonomics & observability** — ramp-up stages ✅ (`--stages`),
-  JSON report ✅ (`--out json`), CSV data feeds ✅ (`data.open`); Prometheus
-  export still to do
+- **M4 — ergonomics & observability** ✅ — ramp-up stages (`--stages`), JSON
+  report (`--out json`), CSV data feeds (`data.open`), live Prometheus
+  `/metrics` (`--prometheus`)
 
 We revisit and rewrite this file as we learn. That is expected, not a failure.
