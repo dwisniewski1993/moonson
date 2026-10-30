@@ -1569,4 +1569,75 @@ mod tests {
         let result: i64 = scenario.call_async(()).await.unwrap();
         assert_eq!(result, 42);
     }
+
+    // --- Integration tests: start a built-in server in-process and exercise a
+    // real protocol round-trip against it. ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_bench_answers_ok() {
+        tokio::spawn(serve_bench("127.0.0.1:18090".to_string()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let response = reqwest::get("http://127.0.0.1:18090/").await.unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_echo_echoes_websocket() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        tokio::spawn(serve_echo("127.0.0.1:19090".to_string()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (mut ws, _response) = tokio_tungstenite::connect_async("ws://127.0.0.1:19090/")
+            .await
+            .unwrap();
+        ws.send(Message::Text("hi".to_string())).await.unwrap();
+        match ws.next().await.unwrap().unwrap() {
+            Message::Text(text) => assert_eq!(text, "hi"),
+            other => panic!("expected a text echo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_grpc_echoes_unary() {
+        tokio::spawn(serve_grpc("127.0.0.1:15090".to_string()));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut client = echo::echo_client::EchoClient::connect("http://127.0.0.1:15090")
+            .await
+            .unwrap();
+        let reply = client
+            .unary(echo::EchoMessage {
+                text: "ping".to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.text, "ping");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_host_function_records_a_request() {
+        tokio::spawn(serve_bench("127.0.0.1:18091".to_string()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stats = Arc::new(Mutex::new(VuStats::new()));
+        let (lua, body) = build_scenario(
+            r#"scenario("t", function() http.get("/") end)"#,
+            "http://127.0.0.1:18091".to_string(),
+            reqwest::Client::new(),
+            stats.clone(),
+        )
+        .unwrap();
+        let _: () = body.call_async(0).await.unwrap();
+        drop(body);
+        drop(lua);
+
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.ok, 1);
+        assert_eq!(stats.failed, 0);
+    }
 }
