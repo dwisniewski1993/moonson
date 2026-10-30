@@ -101,8 +101,8 @@ target, not a dead end.
 ## Attribution: where the per-VU memory goes (M3)
 
 To decide *what* to optimise, compare the scripted path (`run`, one Lua state per
-VU) with the raw path (`load`, plain reqwest, no Lua) at 1000 VUs against the same
-target:
+VU) with the raw path (`load` — a bootstrapping subcommand, since removed — plain
+reqwest, no Lua) at 1000 VUs against the same target:
 
 | 1000 VUs        | req/s   | peak RSS |
 |-----------------|---------|----------|

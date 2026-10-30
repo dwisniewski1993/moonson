@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -415,7 +415,7 @@ impl mlua::UserData for DataSet {
 #[command(
     name = "moonson",
     version,
-    about = "High-density load testing (walking skeleton)"
+    about = "High-density load testing — a Rust engine scripted in Luau (HTTP, WebSocket, gRPC)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -424,21 +424,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fire raw requests at a URL with N virtual users for a fixed duration.
-    Load {
-        /// Target URL to hit.
-        #[arg(default_value = "https://httpbin.org/get")]
-        url: String,
-        /// Number of virtual users (concurrent workers).
-        #[arg(long, default_value_t = 1)]
-        vus: u32,
-        /// How long to run: e.g. 500ms, 10s, 2m.
-        #[arg(long, default_value = "5s")]
-        duration: String,
-        /// Per-request timeout: e.g. 5s, 500ms.
-        #[arg(long, default_value = "30s")]
-        timeout: String,
-    },
     /// Run a Luau scenario across N virtual users for a fixed duration.
     Run {
         /// Path to a .luau scenario file.
@@ -512,16 +497,6 @@ struct RunConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Load {
-            url,
-            vus,
-            duration,
-            timeout,
-        } => {
-            let duration = parse_duration(&duration)?;
-            let timeout = parse_duration(&timeout)?;
-            run_load(url, vus, duration, timeout).await
-        }
         Command::Run {
             script,
             base_url,
@@ -601,47 +576,6 @@ impl VuStats {
             self.checks_failed += 1;
         }
     }
-}
-
-/// Raw request loop (Step 2), behind the `load` subcommand.
-async fn run_load(url: String, vus: u32, duration: Duration, timeout: Duration) -> Result<()> {
-    println!("Running {vus} VU(s) against {url} for {duration:?}...");
-
-    let ok = Arc::new(AtomicU64::new(0));
-    let failed = Arc::new(AtomicU64::new(0));
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("failed to build HTTP client")?;
-    let deadline = Instant::now() + duration;
-
-    let mut handles = Vec::with_capacity(vus as usize);
-    for _ in 0..vus {
-        let client = client.clone();
-        let url = url.clone();
-        let ok = ok.clone();
-        let failed = failed.clone();
-        handles.push(tokio::spawn(async move {
-            while Instant::now() < deadline {
-                match client.get(&url).send().await {
-                    Ok(_response) => ok.fetch_add(1, Ordering::Relaxed),
-                    Err(_error) => failed.fetch_add(1, Ordering::Relaxed),
-                };
-            }
-        }));
-    }
-    for handle in handles {
-        handle.await.context("a virtual user task panicked")?;
-    }
-
-    let ok = ok.load(Ordering::Relaxed);
-    let failed = failed.load(Ordering::Relaxed);
-    let secs = duration.as_secs_f64();
-    let rps = if secs > 0.0 { ok as f64 / secs } else { 0.0 };
-    println!("---");
-    println!("requests: {ok}   errors: {failed}");
-    println!("throughput: {rps:.0} req/s");
-    Ok(())
 }
 
 /// Drive a Luau scenario across `vus` virtual users for `duration`, then report.
@@ -1294,26 +1228,37 @@ fn render_metrics(worker_stats: &[Arc<Mutex<VuStats>>]) -> String {
     let p95 = latency.value_at_quantile(0.95) as f64 / 1000.0;
     let p99 = latency.value_at_quantile(0.99) as f64 / 1000.0;
     format!(
-        "# TYPE moonson_requests_total counter\n\
+        "# HELP moonson_requests_total Requests completed (any status).\n\
+         # TYPE moonson_requests_total counter\n\
          moonson_requests_total {total}\n\
+         # HELP moonson_requests_ok_total Responses received.\n\
          # TYPE moonson_requests_ok_total counter\n\
          moonson_requests_ok_total {ok}\n\
+         # HELP moonson_requests_failed_total Transport failures (no response).\n\
          # TYPE moonson_requests_failed_total counter\n\
          moonson_requests_failed_total {failed}\n\
+         # HELP moonson_checks_passed_total check() assertions that passed.\n\
          # TYPE moonson_checks_passed_total counter\n\
          moonson_checks_passed_total {checks_passed}\n\
+         # HELP moonson_checks_failed_total check() assertions that failed.\n\
          # TYPE moonson_checks_failed_total counter\n\
          moonson_checks_failed_total {checks_failed}\n\
+         # HELP moonson_stream_sent_total WebSocket/gRPC messages sent.\n\
          # TYPE moonson_stream_sent_total counter\n\
          moonson_stream_sent_total {stream_sent}\n\
+         # HELP moonson_stream_received_total WebSocket/gRPC messages received.\n\
          # TYPE moonson_stream_received_total counter\n\
          moonson_stream_received_total {stream_recv}\n\
+         # HELP moonson_iteration_errors_total Iterations that raised an error.\n\
          # TYPE moonson_iteration_errors_total counter\n\
          moonson_iteration_errors_total {iteration_errors}\n\
+         # HELP moonson_latency_p50_ms Median request latency (ms).\n\
          # TYPE moonson_latency_p50_ms gauge\n\
          moonson_latency_p50_ms {p50}\n\
+         # HELP moonson_latency_p95_ms 95th percentile request latency (ms).\n\
          # TYPE moonson_latency_p95_ms gauge\n\
          moonson_latency_p95_ms {p95}\n\
+         # HELP moonson_latency_p99_ms 99th percentile request latency (ms).\n\
          # TYPE moonson_latency_p99_ms gauge\n\
          moonson_latency_p99_ms {p99}\n"
     )
@@ -1504,7 +1449,7 @@ mod tests {
     fn scenario_calls_http_get_for_each_call() {
         // Sync Rust <-> Luau round-trip (no async, no network).
         let lua = Lua::new();
-        let calls = Arc::new(AtomicU64::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let http = lua.create_table().unwrap();
         let counter = calls.clone();
